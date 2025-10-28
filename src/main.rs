@@ -283,6 +283,12 @@ pub fn load_config() -> Config {
     load_config_from_path(None)
 }
 
+impl Default for TaskManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TaskManager {
     pub fn new() -> Self {
         let config = load_config();

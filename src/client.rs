@@ -125,11 +125,10 @@ pub async fn run_client_status(verbose: bool, config: &Config, filter_failed: bo
                     println!();
 
                     // Show path if verbose
-                    if verbose {
-                        if let Some(ref path) = task.path {
+                    if verbose
+                        && let Some(ref path) = task.path {
                             println!("      Path: {}", path);
                         }
-                    }
                 }
                 println!();
             }
@@ -267,7 +266,7 @@ pub async fn run_client_failed(config: &Config) -> Result<()> {
             } else {
                 // Pretty print as table
                 println!("\n=== Failed Tasks ({}) ===\n", failed_tasks.len());
-                println!("{:<6} | {}", "ID", "URL");
+                println!("{:<6} | URL", "ID");
                 println!("{:-<6}-+-{:-<60}", "", "");
                 for task in &failed_tasks {
                     println!("{:<6} | {}", task.id, task.url);

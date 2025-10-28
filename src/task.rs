@@ -85,7 +85,7 @@ impl Task {
 
                 // Send notification with MD5-based notification ID (30s timeout)
                 send_notification(
-                    &url,
+                    url,
                     &format!("Processing: {} 🔄", url),
                     Some(30000),
                     config,
@@ -112,7 +112,7 @@ impl Task {
                         "--simulate",
                         "-o",
                         output_template,
-                        &url,
+                        url,
                     ])
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
@@ -130,7 +130,7 @@ impl Task {
                             let expected_size_bytes = filesize_str.parse::<u64>().ok();
 
                             // Get directory for this URL
-                            let directory = get_video_dir_for_url(&url, config).await;
+                            let directory = get_video_dir_for_url(url, config).await;
 
                             info!(
                                 "GetName success: title={}, size={:?}, dir={}",
@@ -149,7 +149,7 @@ impl Task {
                             error!("GetName failed: unexpected output format");
                             let error_msg = "Failed to parse yt-dlp metadata output".to_string();
                             send_critical_notification(
-                                &url,
+                                url,
                                 &format!("❌ Download failed: {}", error_msg),
                                 config,
                             )
@@ -168,7 +168,7 @@ impl Task {
                             stderr.lines().next().unwrap_or("unknown error")
                         );
                         send_critical_notification(
-                            &url,
+                            url,
                             &format!("❌ Download failed: {}", error_msg),
                             config,
                         )
@@ -182,7 +182,7 @@ impl Task {
                         error!("GetName spawn failed: {}", e);
                         let error_msg = format!("Failed to spawn yt-dlp: {}", e);
                         send_critical_notification(
-                            &url,
+                            url,
                             &format!("❌ Download failed: {}", error_msg),
                             config,
                         )
@@ -220,7 +220,7 @@ impl Task {
                         let error_msg = disk_check_result.unwrap_err();
                         error!("Disk space check failed: {}", error_msg);
                         send_critical_notification(
-                            &url,
+                            url,
                             &format!("❌ Download failed: {}", error_msg),
                             config,
                         )
@@ -242,9 +242,9 @@ impl Task {
                 let expected_size = metadata.expected_size_bytes;
 
                 // Send "Downloading" notification with title (replaces GetName notification)
-                let title_display = title.as_ref().map(|s| s.as_str()).unwrap_or("video");
+                let title_display = title.as_deref().unwrap_or("video");
                 send_notification(
-                    &url,
+                    url,
                     &format!("Downloading: {} 🎬", title_display),
                     Some(3000),
                     config,
@@ -255,7 +255,7 @@ impl Task {
                     url: url_clone.clone(),
                     path: PathBuf::from(&directory).join(format!(
                         "{}.mp4",
-                        title.as_ref().map(|s| s.as_str()).unwrap_or("download")
+                        title.as_deref().unwrap_or("download")
                     )),
                     metadata: DownloadMetadata {
                         title: title.clone(),
@@ -609,9 +609,7 @@ pub async fn spawn_download_video_task(
     config: Config,
 ) -> Result<PathBuf> {
     let title = metadata
-        .title
-        .as_ref()
-        .map(|t| t.as_str())
+        .title.as_deref()
         .unwrap_or("download");
 
     // Construct final destination path
@@ -763,8 +761,8 @@ async fn check_disk_space(path: &str, threshold_mb: u32) -> Result<bool, String>
             if output.status.success() {
                 let output_str = String::from_utf8_lossy(&output.stdout);
                 let lines: Vec<&str> = output_str.lines().collect();
-                if lines.len() >= 2 {
-                    if let Ok(available_mb) = lines[1].trim().parse::<u32>() {
+                if lines.len() >= 2
+                    && let Ok(available_mb) = lines[1].trim().parse::<u32>() {
                         if available_mb < threshold_mb {
                             return Err(format!(
                                 "Disk space below threshold: {}MB < {}MB",
@@ -773,7 +771,6 @@ async fn check_disk_space(path: &str, threshold_mb: u32) -> Result<bool, String>
                         }
                         return Ok(true);
                     }
-                }
             }
             Err("Failed to parse df output".to_string())
         }

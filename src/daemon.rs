@@ -17,8 +17,8 @@ pub async fn run_daemon(config: Config) -> Result<()> {
     // Process queued tasks from offline queueing
     {
         let mut mgr = manager.lock().await;
-        if let Ok(queued) = crate::load_queued_tasks() {
-            if !queued.urls.is_empty() {
+        if let Ok(queued) = crate::load_queued_tasks()
+            && !queued.urls.is_empty() {
                 info!(
                     "Processing {} queued tasks from offline queue",
                     queued.urls.len()
@@ -54,7 +54,6 @@ pub async fn run_daemon(config: Config) -> Result<()> {
                     info!("Cleared queued_tasks.json");
                 }
             }
-        }
     }
 
     // Set up Unix socket
@@ -226,17 +225,17 @@ async fn process_request(
                             )
                             .await;
 
-                            return ServerResponse::Success {
+                            ServerResponse::Success {
                                 message: format!(
                                     "Removed failed task {} and added new task {} for URL: {}",
                                     existing_id, task_id, url_clone
                                 ),
-                            };
+                            }
                         }
                         Err(e) => {
-                            return ServerResponse::Error {
+                            ServerResponse::Error {
                                 message: format!("Failed to re-add task: {}", e),
-                            };
+                            }
                         }
                     }
                 }
