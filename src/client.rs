@@ -8,7 +8,19 @@ async fn send_request(request: ClientRequest, config: &Config) -> Result<ServerR
     let socket_path = &config.socket_path;
 
     // Connect to Unix socket
-    let mut stream = UnixStream::connect(socket_path).await?;
+    let mut stream = UnixStream::connect(socket_path).await.map_err(|e| {
+        match e.kind() {
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
+                anyhow::anyhow!(
+                    "Daemon is not running. Start it with: {} daemon",
+                    std::env::args()
+                        .next()
+                        .unwrap_or_else(|| "tsp_ytdlp".to_string())
+                )
+            }
+            _ => anyhow::anyhow!("Failed to connect to daemon: {}", e),
+        }
+    })?;
 
     // Serialize and send request
     let request_json = serde_json::to_vec(&request)?;

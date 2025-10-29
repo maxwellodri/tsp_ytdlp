@@ -451,6 +451,10 @@ async fn task_processor_loop(manager: Arc<Mutex<TaskManager>>, config: Config) {
                                 url: url.clone(),
                                 path,
                             };
+                            mgr.tasks.set_task_status(
+                                completed_task_id,
+                                crate::task::TaskStatus::Completed,
+                            );
                         }
                     }
                     Ok(Err(e)) => {
@@ -463,10 +467,15 @@ async fn task_processor_loop(manager: Arc<Mutex<TaskManager>>, config: Config) {
                             &config,
                         )
                         .await;
+                        let error_msg = e.to_string();
                         *task = crate::task::Task::Failed {
                             url,
-                            human_readable_error: e.to_string(),
+                            human_readable_error: error_msg.clone(),
                         };
+                        mgr.tasks.set_task_status(
+                            completed_task_id,
+                            crate::task::TaskStatus::Failed(error_msg),
+                        );
                     }
                     Err(e) => {
                         // JoinHandle error (task panicked or aborted)
@@ -476,10 +485,15 @@ async fn task_processor_loop(manager: Arc<Mutex<TaskManager>>, config: Config) {
                         } else {
                             let url = task.url().to_string();
                             error!("Task {} panicked: {}", completed_task_id, e);
+                            let error_msg = format!("Task panicked: {}", e);
                             *task = crate::task::Task::Failed {
                                 url,
-                                human_readable_error: format!("Task panicked: {}", e),
+                                human_readable_error: error_msg.clone(),
                             };
+                            mgr.tasks.set_task_status(
+                                completed_task_id,
+                                crate::task::TaskStatus::Failed(error_msg),
+                            );
                         }
                     }
                 }
@@ -538,6 +552,8 @@ async fn task_processor_loop(manager: Arc<Mutex<TaskManager>>, config: Config) {
                             url: url.clone(),
                             metadata: None,
                         };
+                        mgr.tasks
+                            .set_task_status(task_id, crate::task::TaskStatus::GetName);
                     }
                     if let Err(e) = mgr.save_tasks() {
                         error!("Failed to save tasks: {}", e);
@@ -581,6 +597,8 @@ async fn task_processor_loop(manager: Arc<Mutex<TaskManager>>, config: Config) {
                             .transition(TaskKind::DownloadVideo, None, &config_clone)
                             .await;
                         *t = temp_task;
+                        mgr.tasks
+                            .set_task_status(task_id, crate::task::TaskStatus::DownloadVideo);
                     }
                     if let Err(e) = mgr.save_tasks() {
                         error!("Failed to save tasks: {}", e);

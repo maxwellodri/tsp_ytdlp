@@ -19,6 +19,15 @@ pub enum TaskKind {
     Failed,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum TaskStatus {
+    Queued,
+    GetName,
+    DownloadVideo,
+    Completed,
+    Failed(String),
+}
+
 #[derive(Debug, Clone)]
 pub enum Task {
     Queued {
@@ -84,13 +93,8 @@ impl Task {
                 let url_clone = url.clone();
 
                 // Send notification with MD5-based notification ID (30s timeout)
-                send_notification(
-                    url,
-                    &format!("Processing: {} 🔄", url),
-                    Some(30000),
-                    config,
-                )
-                .await;
+                send_notification(url, &format!("Processing: {} 🔄", url), Some(30000), config)
+                    .await;
 
                 // Determine output template based on URL
                 let output_template = if url.contains("youtube.com") || url.contains("youtu.be") {
@@ -213,12 +217,11 @@ impl Task {
                 };
 
                 // Check disk space using df command
-                let disk_check_result =
-                    check_disk_space(&metadata.directory, config.disk_threshold).await;
-                match disk_check_result {
-                    Ok(false) | Err(_) => {
-                        let error_msg = disk_check_result.unwrap_err();
-                        error!("Disk space check failed: {}", error_msg);
+                let available_mb = match get_disk_space(&metadata.directory).await {
+                    Ok(mb) => mb,
+                    Err(e) => {
+                        let error_msg = format!("Failed to check disk space: {}", e);
+                        error!("{}", error_msg);
                         send_critical_notification(
                             url,
                             &format!("❌ Download failed: {}", error_msg),
@@ -231,32 +234,57 @@ impl Task {
                         };
                         return;
                     }
-                    Ok(true) => {
-                        info!("Disk space check passed");
-                    }
+                };
+
+                // Check if available space is below threshold
+                if available_mb < config.disk_threshold {
+                    let error_msg = format!(
+                        "Disk space below threshold: {}MB < {}MB",
+                        available_mb, config.disk_threshold
+                    );
+                    error!("{}", error_msg);
+                    send_critical_notification(
+                        url,
+                        &format!("❌ Download failed: {}", error_msg),
+                        config,
+                    )
+                    .await;
+                    *self = Task::Failed {
+                        url: url_clone,
+                        human_readable_error: error_msg,
+                    };
+                    return;
                 }
+
+                info!(
+                    "Disk space check passed ( {}MB < {}MB )",
+                    config.disk_threshold, available_mb
+                );
 
                 // Transition to DownloadVideo state - this will be used for status display
                 let title = metadata.title.clone();
                 let directory = metadata.directory.clone();
                 let expected_size = metadata.expected_size_bytes;
 
-                // Send "Downloading" notification with title (replaces GetName notification)
+                // Check if this is a restart (cache directory with fragments exists)
+                let url_hash = format!("{:x}", md5::compute(url.as_bytes()));
+                let cache_dir = PathBuf::from(&config.cache_dir);
+                let unique_cache = cache_dir.join(&url_hash);
+                let is_restart = unique_cache.exists();
+
+                // Send notification with title (different message for restart vs fresh download)
                 let title_display = title.as_deref().unwrap_or("video");
-                send_notification(
-                    url,
-                    &format!("Downloading: {} 🎬", title_display),
-                    Some(3000),
-                    config,
-                )
-                .await;
+                let notification_message = if is_restart {
+                    format!("Resuming download: {} 🔄", title_display)
+                } else {
+                    format!("Downloading: {} 🎬", title_display)
+                };
+                send_notification(url, &notification_message, Some(3000), config).await;
 
                 *self = Task::DownloadVideo {
                     url: url_clone.clone(),
-                    path: PathBuf::from(&directory).join(format!(
-                        "{}.mp4",
-                        title.as_deref().unwrap_or("download")
-                    )),
+                    path: PathBuf::from(&directory)
+                        .join(format!("{}.mp4", title.as_deref().unwrap_or("download"))),
                     metadata: DownloadMetadata {
                         title: title.clone(),
                         expected_size_bytes: expected_size,
@@ -331,6 +359,7 @@ pub struct Tasks {
     task_list: BTreeMap<u64, Task>,
     index_counter: u64,
     active_tasks: HashMap<u64, JoinHandle<Result<TaskOperationResult>>>,
+    status_channels: HashMap<u64, tokio::sync::watch::Sender<TaskStatus>>,
 }
 
 impl Tasks {
@@ -374,6 +403,7 @@ impl Tasks {
             info!("Aborted active task {}", id);
         }
 
+        self.remove_status_channel(id);
         self.task_list.remove(&id).is_some()
     }
 
@@ -434,6 +464,10 @@ impl Tasks {
         let task = Task::Queued { url };
         self.task_list.insert(task_id, task);
 
+        // Initialize status channel
+        let (tx, _rx) = tokio::sync::watch::channel(TaskStatus::Queued);
+        self.status_channels.insert(task_id, tx);
+
         Ok(task_id)
     }
 
@@ -446,6 +480,37 @@ impl Tasks {
 
     pub fn len(&self) -> usize {
         self.task_list.len()
+    }
+
+    /// Create a completion handle for observing task status changes
+    /// Should be called when a task is first added
+    pub fn create_completion_handle(
+        &mut self,
+        id: u64,
+    ) -> tokio::sync::watch::Receiver<TaskStatus> {
+        let (tx, rx) = tokio::sync::watch::channel(TaskStatus::Queued);
+        self.status_channels.insert(id, tx);
+        rx
+    }
+
+    /// Get a completion handle for an existing task (if available)
+    pub fn get_completion_handle(
+        &self,
+        id: u64,
+    ) -> Option<tokio::sync::watch::Receiver<TaskStatus>> {
+        self.status_channels.get(&id).map(|tx| tx.subscribe())
+    }
+
+    /// Update task status and notify all observers
+    pub fn set_task_status(&mut self, id: u64, status: TaskStatus) {
+        if let Some(tx) = self.status_channels.get(&id) {
+            let _ = tx.send(status);
+        }
+    }
+
+    /// Clean up status channel when task is removed
+    fn remove_status_channel(&mut self, id: u64) {
+        self.status_channels.remove(&id);
     }
 }
 
@@ -578,29 +643,6 @@ pub async fn touch_file(path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-/// Extract progress percentage from yt-dlp output line
-/// Example: "[download] 25.3% of 1.10GiB at 10.87MiB/s ETA 01:40" => Some(25.3)
-/// Returns None if the line doesn't contain progress information
-pub fn extract_progress_from_line(line: &str) -> Option<f32> {
-    // Look for lines starting with [download] and containing a percentage
-    if !line.starts_with("[download]") {
-        return None;
-    }
-
-    // Find the percentage value (e.g., "25.3%")
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    for part in parts {
-        if part.ends_with('%') {
-            // Remove the '%' and try to parse as f32
-            if let Ok(progress) = part.trim_end_matches('%').parse::<f32>() {
-                return Some(progress);
-            }
-        }
-    }
-
-    None
-}
-
 /// Spawn and execute a video download task
 /// Returns Ok(PathBuf) with final path on success, Err on failure
 pub async fn spawn_download_video_task(
@@ -608,9 +650,7 @@ pub async fn spawn_download_video_task(
     metadata: GetNameMetadata,
     config: Config,
 ) -> Result<PathBuf> {
-    let title = metadata
-        .title.as_deref()
-        .unwrap_or("download");
+    let title = metadata.title.as_deref().unwrap_or("download");
 
     // Construct final destination path
     let final_path = PathBuf::from(&metadata.directory).join(format!("{}.mp4", title));
@@ -733,9 +773,9 @@ pub async fn spawn_download_video_task(
     Ok(final_path)
 }
 
-/// Check if there is sufficient disk space available
-/// Returns Ok(true) if sufficient space, Err with message if not
-async fn check_disk_space(path: &str, threshold_mb: u32) -> Result<bool, String> {
+/// Get available disk space in megabytes for the given path
+/// Returns Ok(available_mb) with the available space, or Err if unable to determine
+async fn get_disk_space(path: &str) -> anyhow::Result<u32> {
     let mut current_path = std::path::Path::new(path);
 
     // Find first existing parent directory
@@ -743,37 +783,32 @@ async fn check_disk_space(path: &str, threshold_mb: u32) -> Result<bool, String>
         if let Some(parent) = current_path.parent() {
             current_path = parent;
         } else {
-            return Err("Cannot determine disk space for path".to_string());
+            anyhow::bail!("Cannot determine disk space for path");
         }
     }
 
     // Use df command to check available space
-    match Command::new("df")
+    let output = Command::new("df")
         .arg("--output=avail")
         .arg("--block-size=1M") // Output in megabytes
         .arg(current_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .await
-    {
-        Ok(output) => {
-            if output.status.success() {
-                let output_str = String::from_utf8_lossy(&output.stdout);
-                let lines: Vec<&str> = output_str.lines().collect();
-                if lines.len() >= 2
-                    && let Ok(available_mb) = lines[1].trim().parse::<u32>() {
-                        if available_mb < threshold_mb {
-                            return Err(format!(
-                                "Disk space below threshold: {}MB < {}MB",
-                                available_mb, threshold_mb
-                            ));
-                        }
-                        return Ok(true);
-                    }
-            }
-            Err("Failed to parse df output".to_string())
-        }
-        Err(e) => Err(format!("Failed to check disk space: {}", e)),
+        .await?;
+
+    if !output.status.success() {
+        anyhow::bail!("df command failed");
     }
+
+    let output_str = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = output_str.lines().collect();
+
+    if lines.len() >= 2 {
+        if let Ok(available_mb) = lines[1].trim().parse::<u32>() {
+            return Ok(available_mb);
+        }
+    }
+
+    anyhow::bail!("Failed to parse df output")
 }

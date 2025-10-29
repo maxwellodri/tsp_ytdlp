@@ -170,7 +170,6 @@ async fn test_task_activity_check() {
             directory: "/tmp".to_string(),
             started_at: None,
             process_id: None,
-            progress_percent: None,
             log_file: None,
         },
     };
@@ -187,33 +186,6 @@ async fn test_task_activity_check() {
         human_readable_error: "Test error".to_string(),
     };
     assert!(!failed_task.is_active());
-
-    cleanup().await;
-}
-
-#[tokio::test]
-async fn test_enhanced_execution_methods() {
-    cleanup().await;
-    let config = test_config();
-
-    let mut tasks = Tasks::default();
-
-    // Add a test URL (using a fake URL to avoid actual downloads in tests)
-    let url = "https://example.com/fake-video".to_string();
-    let task_id = tasks.add_url_as_task(url).expect("Failed to add task");
-
-    // Test that execute_task method exists and handles fake URLs gracefully
-    let result = tasks.execute_task(task_id, &config).await;
-    // We expect this to fail since it's a fake URL, but the method should exist
-    assert!(result.is_err());
-
-    // Test execute_active_tasks method
-    let results = tasks.execute_active_tasks(&config).await;
-    assert!(results.len() <= 1); // Should have attempted at least our task
-
-    // Test execute_with_concurrency method
-    let results = tasks.execute_with_concurrency(&config, 2).await;
-    assert!(results.len() <= 1); // Should respect concurrency limits
 
     cleanup().await;
 }
@@ -297,7 +269,12 @@ async fn test_notification_config() {
         &config_disabled,
     )
     .await;
-    send_critical_notification("https://test.com", "🔍 DEBUG: Critical notification should NOT appear during tests", &config_disabled).await;
+    send_critical_notification(
+        "https://test.com",
+        "🔍 DEBUG: Critical notification should NOT appear during tests",
+        &config_disabled,
+    )
+    .await;
 
     // Test that Config::default() has notifications enabled by default
     let default_config = Config::default();
@@ -313,21 +290,26 @@ async fn test_notification_config() {
 #[tokio::test]
 async fn test_end_to_end_video_download() {
     cleanup().await;
-    
+
     // Initialize tracing for detailed logging
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new("tsp_ytdlp=debug"))
         .try_init();
-    
-    use crate::task::{Task, Tasks};
+
+    use crate::task::{Task, TaskStatus, Tasks};
+    use crate::TaskManager;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
 
     println!("🔄 Starting end-to-end video download test");
-    
+
     // Use standardized test config
     let test_config = test_config();
-    println!("📋 Test config: should_notify_send = {}, throttle = {:?}", 
-             test_config.should_notify_send, test_config.throttle);
-    
+    println!(
+        "📋 Test config: should_notify_send = {}, throttle = {:?}",
+        test_config.should_notify_send, test_config.throttle
+    );
+
     let test_dir = "/tmp/tsp_ytdlp";
     println!("📁 Using test directory: {}", test_dir);
 
@@ -347,26 +329,55 @@ async fn test_end_to_end_video_download() {
         .expect("Failed to add test URL");
     println!("✅ Added task {} for URL: {}", task_id, TEST_URL);
 
-    // Execute the complete download pipeline
-    println!("🎬 Starting download of test video: {}", TEST_URL);
-    println!("⚙️ Config summary: download_dir={}, cache_dir={}",
-             test_config.download_dir, test_config.cache_dir);
-    
-    let result = tasks.execute_task(task_id, &test_config).await;
+    // Get completion handle to observe task progress
+    let mut rx = tasks
+        .get_completion_handle(task_id)
+        .expect("Failed to get completion handle");
+
+    // Spawn a task manager with the test config in a background task
+    let manager = Arc::new(Mutex::new(TaskManager::new_with_config(test_config.clone())));
+    manager.lock().await.tasks = tasks;
+
+    // Start a simplified task processor (similar to daemon but for testing)
+    let manager_clone = manager.clone();
+    let config_clone = test_config.clone();
+    let processor_handle = tokio::spawn(async move {
+        // Run processor loop for just this one task
+        task_processor_loop_single_task(manager_clone, config_clone, task_id).await;
+    });
+
+    // Wait for task to complete or fail (with 30s timeout)
+    use tokio::time::{timeout, Duration};
+
+    println!("⏳ Waiting for download to complete (timeout: 30s)...");
+    let result = timeout(Duration::from_secs(30), async {
+        loop {
+            rx.changed().await.unwrap();
+            let status = rx.borrow().clone();
+            println!("📊 Task status: {:?}", status);
+            match status {
+                TaskStatus::Completed => return Ok(()),
+                TaskStatus::Failed(e) => return Err(e),
+                _ => continue, // Keep waiting for final state
+            }
+        }
+    })
+    .await;
 
     match result {
-        Ok(()) => {
-            println!("Download completed successfully");
+        Ok(Ok(())) => {
+            println!("✅ Download completed successfully");
 
             // Verify the task is now completed
-            let task = tasks.get_task(task_id).expect("Task should exist");
+            let mgr = manager.lock().await;
+            let task = mgr.tasks.get_task(task_id).expect("Task should exist");
             assert!(
                 matches!(task, Task::Completed { .. }),
                 "Task should be completed"
             );
 
             // Debug: List all files in the test directory
-            println!("Contents of test directory:");
+            println!("📂 Contents of test directory:");
             let mut dir_entries = fs::read_dir(test_dir)
                 .await
                 .expect("Failed to read test directory");
@@ -378,7 +389,7 @@ async fn test_end_to_end_video_download() {
             {
                 let path = entry.path();
                 let name = path.file_name().unwrap().to_string_lossy().to_string();
-                println!("  {}", name);
+                println!("  📄 {}", name);
                 all_files.push(path);
             }
 
@@ -423,41 +434,183 @@ async fn test_end_to_end_video_download() {
                         "Video duration should be approximately 19 seconds, got {:.1} seconds",
                         info.duration
                     );
-                    println!("Video duration verified: {:.1} seconds", info.duration);
+                    println!("✅ Video duration verified: {:.1} seconds", info.duration);
 
                     // Verify it has both video and audio streams
                     assert!(info.has_video, "Video file should contain a video stream");
                     assert!(info.has_audio, "Video file should contain an audio stream");
                     println!(
-                        "Video streams verified: video={}, audio={}",
+                        "✅ Video streams verified: video={}, audio={}",
                         info.has_video, info.has_audio
                     );
                 }
                 Err(e) => {
-                    println!("Warning: Could not verify video properties: {}", e);
+                    println!("⚠️  Warning: Could not verify video properties: {}", e);
                     // Don't fail the test if ffprobe is not available
                 }
             }
 
-            println!("Downloaded file verified at: {}", download_path.display());
+            println!("✅ Downloaded file verified at: {}", download_path.display());
         }
-        Err(e) => {
-            // Check if the task failed and get error details
-            let task = tasks.get_task(task_id).expect("Task should exist");
-            if let Task::Failed {
-                human_readable_error,
-                ..
-            } = task
-            {
-                panic!("Download failed: {}", human_readable_error);
-            } else {
-                panic!("Download failed with error: {}", e);
-            }
-        }
+        Ok(Err(e)) => panic!("❌ Task failed: {}", e),
+        Err(_) => panic!("❌ Test timeout after 30s"),
     }
 
-    // Clean up test directory
+    // Cleanup
+    processor_handle.abort();
     cleanup().await;
+}
+
+// Helper function to run a simplified task processor for a single task
+async fn task_processor_loop_single_task(
+    manager: Arc<Mutex<TaskManager>>,
+    config: Config,
+    target_task_id: u64,
+) {
+    use crate::task::{TaskKind, TaskOperationResult, TaskStatus};
+
+    loop {
+        let mut mgr = manager.lock().await;
+
+        // Check if target task is done
+        if let Some(task) = mgr.tasks.get_task(target_task_id) {
+            if matches!(task, Task::Completed { .. } | Task::Failed { .. }) {
+                drop(mgr);
+                return; // Task is done, exit
+            }
+        } else {
+            drop(mgr);
+            return; // Task doesn't exist, exit
+        }
+
+        // If we have an active task, wait for it
+        if mgr.tasks.has_active_task(target_task_id) {
+            let handle = mgr.tasks.remove_active_task(target_task_id).unwrap();
+            drop(mgr);
+
+            let task_result = handle.await;
+
+            let mut mgr = manager.lock().await;
+            if let Some(task) = mgr.tasks.get_task_mut(target_task_id) {
+                match task_result {
+                    Ok(Ok(TaskOperationResult::GetNameComplete(metadata))) => {
+                        if let Task::GetName { url, .. } = task {
+                            info!("GetName completed for task {}", target_task_id);
+                            *task = Task::GetName {
+                                url: url.clone(),
+                                metadata: Some(metadata),
+                            };
+                        }
+                    }
+                    Ok(Ok(TaskOperationResult::DownloadComplete(path))) => {
+                        if let Task::DownloadVideo { url, .. } = task {
+                            info!("Download completed for task {}", target_task_id);
+                            *task = Task::Completed {
+                                url: url.clone(),
+                                path,
+                            };
+                            mgr.tasks
+                                .set_task_status(target_task_id, TaskStatus::Completed);
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        let url = task.url().to_string();
+                        let error_msg = e.to_string();
+                        *task = Task::Failed {
+                            url,
+                            human_readable_error: error_msg.clone(),
+                        };
+                        mgr.tasks
+                            .set_task_status(target_task_id, TaskStatus::Failed(error_msg));
+                    }
+                    Err(e) => {
+                        if !e.is_cancelled() {
+                            let url = task.url().to_string();
+                            let error_msg = format!("Task panicked: {}", e);
+                            *task = Task::Failed {
+                                url,
+                                human_readable_error: error_msg.clone(),
+                            };
+                            mgr.tasks
+                                .set_task_status(target_task_id, TaskStatus::Failed(error_msg));
+                        }
+                    }
+                }
+            }
+            drop(mgr);
+            continue;
+        }
+
+        // Check if we need to spawn next operation
+        let task_clone = mgr.tasks.get_task(target_task_id).cloned();
+
+        match task_clone {
+            Some(Task::Queued { url }) => {
+                // Spawn GetName
+                let config_clone = config.clone();
+                if let Some(t) = mgr.tasks.get_task_mut(target_task_id) {
+                    *t = Task::GetName {
+                        url: url.clone(),
+                        metadata: None,
+                    };
+                    mgr.tasks
+                        .set_task_status(target_task_id, TaskStatus::GetName);
+                }
+
+                let handle = tokio::spawn(async move {
+                    let mut task = Task::Queued { url: url.clone() };
+                    task.transition(TaskKind::GetName, None, &config_clone)
+                        .await;
+
+                    if let Task::GetName {
+                        metadata: Some(m), ..
+                    } = task
+                    {
+                        Ok(TaskOperationResult::GetNameComplete(m))
+                    } else {
+                        Err(anyhow::anyhow!("GetName transition failed"))
+                    }
+                });
+
+                mgr.tasks.insert_active_task(target_task_id, handle);
+            }
+            Some(Task::GetName {
+                url,
+                metadata: Some(metadata),
+            }) => {
+                // Spawn Download
+                let config_clone = config.clone();
+
+                if let Some(t) = mgr.tasks.get_task_mut(target_task_id) {
+                    let mut temp_task = Task::GetName {
+                        url: url.clone(),
+                        metadata: Some(metadata.clone()),
+                    };
+                    temp_task
+                        .transition(TaskKind::DownloadVideo, None, &config_clone)
+                        .await;
+                    *t = temp_task;
+                    mgr.tasks
+                        .set_task_status(target_task_id, TaskStatus::DownloadVideo);
+                }
+
+                let handle = tokio::spawn(async move {
+                    let path =
+                        crate::task::spawn_download_video_task(url, metadata, config_clone).await?;
+                    Ok(TaskOperationResult::DownloadComplete(path))
+                });
+
+                mgr.tasks.insert_active_task(target_task_id, handle);
+            }
+            _ => {
+                // Nothing to do
+                drop(mgr);
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            }
+        }
+
+        drop(mgr);
+    }
 }
 
 #[derive(Debug)]
@@ -549,9 +702,7 @@ async fn test_task_with_notification_config() {
 
     // Test that Tasks methods work with notification config
     let mut tasks = Tasks::default();
-    let result = tasks
-        .add_url_as_task_with_notification("https://test.com".to_string(), &config_disabled)
-        .await;
+    let result = tasks.add_url_as_task("https://test.com".to_string());
     assert!(result.is_ok());
 
     cleanup().await;

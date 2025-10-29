@@ -7,14 +7,14 @@ mod task;
 mod tests;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use common::APP;
 use directories::{BaseDirs, ProjectDirs};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Stdio;
 use task::{Task, TaskKind, Tasks};
-use tokio::process::Command;
+use tokio::process::Command as TokioCommand;
 use tracing::{info, warn};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
@@ -73,15 +73,16 @@ pub struct ConfigSummary {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(default)]
 pub struct Config {
     pub concurrent_downloads: u8,
     pub socket_path: String,
-    pub disk_threshold: u32,       // Megabytes to keep in reserve
-    pub download_dir: String,      // Default directory for downloads
-    pub should_notify_send: bool,  // Whether to send desktop notifications
-    pub cache_dir: String,         // Directory for temporary files (fragments, json, etc)
-    pub throttle: Option<u32>,     // Download speed limit in KB/s, None = unlimited
-    pub video_quality: String,     // Video quality: "480p", "720p", "1080p", "1440p", "2160p", "best", or custom
+    pub disk_threshold: u32,      // Megabytes to keep in reserve
+    pub download_dir: String,     // Default directory for downloads
+    pub should_notify_send: bool, // Whether to send desktop notifications
+    pub cache_dir: String,        // Directory for temporary files (fragments, json, etc)
+    pub throttle: Option<u32>,    // Download speed limit in KB/s, None = unlimited
+    pub video_quality: String, // Video quality: "480p", "720p", "1080p", "1440p", "2160p", "best", or custom
 }
 
 impl Default for Config {
@@ -92,12 +93,12 @@ impl Default for Config {
         Self {
             concurrent_downloads: 1,
             socket_path: default_socket_path,
-            disk_threshold: 1024 * 2,           // 2GB default
+            disk_threshold: 1024 * 2, // 2GB default
             download_dir: default_download_dir,
-            should_notify_send: true,           // Default to enabled
-            cache_dir: default_cache_dir,       // Use XDG cache dir
-            throttle: None,                     // Unlimited download speed by default
-            video_quality: "720p".to_string(),  // 720p default
+            should_notify_send: true,          // Default to enabled
+            cache_dir: default_cache_dir,      // Use XDG cache dir
+            throttle: None,                    // Unlimited download speed by default
+            video_quality: "720p".to_string(), // 720p default
         }
     }
 }
@@ -122,34 +123,40 @@ pub struct TaskManager {
 
 #[derive(Parser)]
 #[command(name = APP)]
-#[command(about = "YouTube download task spooler")]
+#[command(about = "yt-dlp task spooler")]
 pub struct Args {
-    #[arg(long, help = "Run in daemon mode")]
-    pub daemon: bool,
+    #[command(subcommand)]
+    pub command: Option<Command>,
 
-    #[arg(short, long, help = "Remove task(s) by ID (comma-separated for multiple)")]
-    pub remove: Option<String>,
-
-    #[arg(long, help = "Clear all completed downloads")]
-    pub clear: bool,
+    #[arg(help = "URL to download")]
+    pub url: Option<String>,
 
     #[arg(short, long, help = "Show verbose status information")]
     pub verbose: bool,
 
-    #[arg(short, long, help = "Kill running daemon")]
+    #[arg(long, help = "Kill the running daemon")]
     pub kill: bool,
 
-    #[arg(long, help = "Show detailed info/logs for task ID")]
+    #[arg(long, help = "Remove task(s) by ID (comma-separated for multiple)")]
+    pub remove: Option<String>,
+
+    #[arg(long, help = "Show detailed info/logs for a task")]
     pub info: Option<u64>,
+
+    #[arg(long, help = "Clear all completed downloads")]
+    pub clear: bool,
 
     #[arg(long, help = "Show only failed tasks")]
     pub failed: bool,
 
-    #[arg(long, help = "Path to custom config file")]
+    #[arg(long, global = true, help = "Path to custom config file")]
     pub config: Option<String>,
+}
 
-    #[arg(help = "URL to download (client mode only)")]
-    pub url: Option<String>,
+#[derive(Subcommand)]
+pub enum Command {
+    #[command(about = "Start the daemon")]
+    Daemon,
 }
 
 /// Parse comma-separated list of task IDs
@@ -500,51 +507,6 @@ impl TaskManager {
             self.tasks.remove_task(id);
         }
     }
-
-    pub async fn check_disk_space(&self, path: &str) -> Result<bool, String> {
-        let mut current_path = std::path::Path::new(path);
-
-        // Find first existing parent directory
-        while !current_path.exists() {
-            if let Some(parent) = current_path.parent() {
-                current_path = parent;
-            } else {
-                return Err("Cannot determine disk space for path".to_string());
-            }
-        }
-
-        // Use df command to check available space
-        match Command::new("df")
-            .arg("--output=avail")
-            .arg("--block-size=1M") // Output in megabytes
-            .arg(current_path)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-        {
-            Ok(output) => {
-                if output.status.success() {
-                    let output_str = String::from_utf8_lossy(&output.stdout);
-                    let lines: Vec<&str> = output_str.lines().collect();
-                    if lines.len() >= 2
-                        && let Ok(available_mb) = lines[1].trim().parse::<u32>()
-                    {
-                        let has_space = available_mb >= self.config.disk_threshold;
-                        if !has_space {
-                            return Err(format!(
-                                "Disk full: {}MB < {}MB threshold",
-                                available_mb, self.config.disk_threshold
-                            ));
-                        }
-                        return Ok(true);
-                    }
-                }
-                Err("Failed to parse df output".to_string())
-            }
-            Err(e) => Err(format!("Failed to check disk space: {e}")),
-        }
-    }
 }
 
 pub fn get_default_video_dir() -> String {
@@ -556,10 +518,7 @@ pub fn get_default_video_dir() -> String {
 pub fn get_default_cache_dir() -> String {
     let project_dirs =
         ProjectDirs::from("", "", APP).expect("Could not determine project directories");
-    project_dirs
-        .cache_dir()
-        .to_string_lossy()
-        .to_string()
+    project_dirs.cache_dir().to_string_lossy().to_string()
 }
 
 /// Check if the daemon is currently running by attempting to connect to its Unix socket
@@ -668,7 +627,7 @@ pub async fn get_video_dir_for_url(url: &str, config: &Config) -> String {
     }
 
     // Try to execute the script
-    match Command::new(&script_path)
+    match TokioCommand::new(&script_path)
         .arg(url)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -789,7 +748,7 @@ pub async fn validate_download_dir(download_dir: &str) -> Result<()> {
 pub async fn validate_ytdlp() -> Result<()> {
     tracing::debug!("Validating yt-dlp installation...");
 
-    match Command::new("yt-dlp")
+    match TokioCommand::new("yt-dlp")
         .arg("--version")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -816,7 +775,7 @@ pub async fn validate_ytdlp() -> Result<()> {
 pub async fn validate_curl() -> Result<()> {
     tracing::debug!("Validating curl installation...");
 
-    match Command::new("curl")
+    match TokioCommand::new("curl")
         .arg("--version")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -887,36 +846,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
     let config = load_config_from_path(args.config.as_deref());
 
-    // Initialize tracing for daemon mode only
-    if args.daemon {
-        init_tracing()?;
-        info!("Starting {} daemon", APP);
+    match args.command {
+        Some(Command::Daemon) => {
+            // Run as daemon
+            init_tracing()?;
+            info!("Starting {} daemon", APP);
+            validate_ytdlp().await?;
+            validate_curl().await?;
+            validate_download_dir(&config.download_dir).await?;
 
-        // Validate requirements before starting daemon
-        validate_ytdlp().await?;
-        validate_curl().await?;
-        validate_download_dir(&config.download_dir).await?;
-
-        daemon::run_daemon(config).await?;
-    } else {
-        // Load config for client operations
-
-        if let Some(ref remove_str) = args.remove {
-            let ids = parse_id_list(remove_str).map_err(|e| anyhow::anyhow!(e))?;
-            client::run_client_remove(ids, &config).await?;
-        } else if args.clear {
-            client::run_client_clear(&config).await?;
-        } else if args.kill {
-            client::run_client_kill(&config).await?;
-        } else if let Some(id) = args.info {
-            client::run_client_info(id, &config).await?;
-        } else if args.failed {
-            client::run_client_failed(&config).await?;
-        } else if let Some(url) = args.url {
-            client::run_client_add(url, &config).await?;
-        } else {
-            // Default behavior: show status (filter out failed tasks)
-            client::run_client_status(args.verbose, &config, true).await?;
+            daemon::run_daemon(config).await?;
+        }
+        None => {
+            // Client mode
+            if args.kill {
+                client::run_client_kill(&config).await?;
+            } else if let Some(ref remove_str) = args.remove {
+                let ids = parse_id_list(remove_str).map_err(|e| anyhow::anyhow!(e))?;
+                client::run_client_remove(ids, &config).await?;
+            } else if let Some(id) = args.info {
+                client::run_client_info(id, &config).await?;
+            } else if args.clear {
+                client::run_client_clear(&config).await?;
+            } else if let Some(url) = args.url {
+                client::run_client_add(url, &config).await?;
+            } else {
+                // Default: show status
+                if args.failed {
+                    client::run_client_failed(&config).await?;
+                } else {
+                    client::run_client_status(args.verbose, &config, true).await?;
+                }
+            }
         }
     }
 
