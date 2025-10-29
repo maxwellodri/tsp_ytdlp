@@ -273,8 +273,21 @@ async fn process_request(
                                 error!("Failed to save tasks: {}", e);
                             }
 
+                            // Send notification about new task
+                            let url_clone = url.clone();
+                            let config_clone = config.clone();
+                            drop(mgr);
+
+                            crate::common::send_notification(
+                                &url_clone,
+                                &format!("Task {} added for URL: {}", task_id, url_clone),
+                                Some(3000),
+                                &config_clone,
+                            )
+                            .await;
+
                             ServerResponse::Success {
-                                message: format!("Task {} added for URL: {}", task_id, url),
+                                message: format!("Task {} added for URL: {}", task_id, url_clone),
                             }
                         }
                         Err(e) => ServerResponse::Error {

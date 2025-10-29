@@ -163,6 +163,18 @@ pub async fn run_client_status(verbose: bool, config: &Config, filter_failed: bo
                     }
                     println!();
                 }
+
+                // Print failed tasks in verbose mode (only if not filtered out)
+                if !filter_failed && !failed_tasks.is_empty() {
+                    println!("Failed ({}):", failed_tasks.len());
+                    for task in &failed_tasks {
+                        println!("  #{}: {}", task.id, task.url);
+                        if let Some(ref error) = task.error {
+                            println!("      Error: {}", error);
+                        }
+                    }
+                    println!();
+                }
             } else {
                 // Non-verbose mode: current -> queued -> completed (new order)
 
@@ -219,18 +231,11 @@ pub async fn run_client_status(verbose: bool, config: &Config, filter_failed: bo
                         println!("{}", task.url);
                     }
                 }
-            }
 
-            // Print failed tasks (only if not filtered out)
-            if !filter_failed && !failed_tasks.is_empty() {
-                println!("Failed ({}):", failed_tasks.len());
-                for task in &failed_tasks {
-                    println!("  #{}: {}", task.id, task.url);
-                    if let Some(ref error) = task.error {
-                        println!("      Error: {}", error);
-                    }
+                // Print failed count only in non-verbose mode (only if not filtered out)
+                if !filter_failed && !failed_tasks.is_empty() {
+                    println!("Failed ({})", failed_tasks.len());
                 }
-                println!();
             }
 
             // Print summary if no tasks

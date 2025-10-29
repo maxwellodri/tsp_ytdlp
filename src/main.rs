@@ -136,10 +136,10 @@ pub struct Args {
     #[arg(short, long, help = "Show verbose status information")]
     pub verbose: bool,
 
-    #[arg(long, help = "Kill the running daemon")]
+    #[arg(short = 'k', long, help = "Kill the running daemon")]
     pub kill: bool,
 
-    #[arg(long, help = "Remove task(s) by ID (comma-separated for multiple)")]
+    #[arg(short = 'r', long, help = "Remove task(s) by ID (comma-separated for multiple)")]
     pub remove: Option<String>,
 
     #[arg(long, help = "Show detailed info/logs for a task")]
@@ -561,7 +561,7 @@ pub async fn append_to_queued_tasks(url: String, config: &Config) -> Result<()> 
     queued.urls.push(url.clone());
     let content = serde_json::to_string_pretty(&queued)?;
     std::fs::write(&queued_path, content)?;
-    send_notification(&url, &format!("Added {url} to queued tasks\ndaemon is not running 🤨"), timeout_ms, config)
+    send_notification(&url, &format!("Added {url} to queued tasks\ndaemon is not running 🤨"), Some(3000), config).await;
 
     Ok(())
 }
@@ -894,10 +894,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         let binary_path =
                             std::env::current_exe().expect("Failed to get current executable path");
 
-                        // Get all args except the binary name and filter out --tmux and --kill
+                        // Get all args except the binary name and filter out --tmux, --kill, and -k
                         let filtered_args: Vec<String> = std::env::args()
                             .skip(1)
-                            .filter(|arg| arg != "--tmux" && arg != "--kill")
+                            .filter(|arg| arg != "--tmux" && arg != "--kill" && arg != "-k")
                             .collect();
 
                         // Build tmux command
