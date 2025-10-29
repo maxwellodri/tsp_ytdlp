@@ -804,11 +804,10 @@ async fn get_disk_space(path: &str) -> anyhow::Result<u32> {
     let output_str = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = output_str.lines().collect();
 
-    if lines.len() >= 2 {
-        if let Ok(available_mb) = lines[1].trim().parse::<u32>() {
+    if lines.len() >= 2
+        && let Ok(available_mb) = lines[1].trim().parse::<u32>() {
             return Ok(available_mb);
         }
-    }
 
     anyhow::bail!("Failed to parse df output")
 }
