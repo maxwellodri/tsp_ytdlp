@@ -44,7 +44,7 @@ pub async fn run_client_add(url: String, config: &Config) -> Result<()> {
     // Check if daemon is active
     if !crate::is_daemon_active(config).await {
         // Daemon is not running, queue the task for next startup
-        crate::append_to_queued_tasks(url.clone())?;
+        crate::append_to_queued_tasks(url.clone(), config).await?;
         println!("Daemon not running, queued for next startup: {}", url);
         return Ok(());
     }
@@ -354,6 +354,12 @@ pub async fn run_client_clear(config: &Config) -> Result<()> {
 
 /// Kill the daemon
 pub async fn run_client_kill(config: &Config) -> Result<()> {
+    // Check if daemon is running first
+    if !crate::is_daemon_active(config).await {
+        println!("Daemon is not running");
+        return Ok(());
+    }
+
     let sender_pid = std::process::id();
     let request = ClientRequest::Kill { sender_pid };
 

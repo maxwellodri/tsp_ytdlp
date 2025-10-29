@@ -533,6 +533,7 @@ async fn task_processor_loop(manager: Arc<Mutex<TaskManager>>, config: Config) {
                 crate::task::Task::GetName {
                     metadata: Some(_), ..
                 } => Some((*id, task.clone())),
+                crate::task::Task::DownloadVideo { .. } => Some((*id, task.clone())),
                 _ => None,
             }
         });
@@ -609,6 +610,49 @@ async fn task_processor_loop(manager: Arc<Mutex<TaskManager>>, config: Config) {
                         let path =
                             crate::task::spawn_download_video_task(url, metadata, config_clone)
                                 .await?;
+                        Ok(TaskOperationResult::DownloadComplete(path))
+                    });
+
+                    mgr.tasks.insert_active_task(task_id, handle);
+                }
+                crate::task::Task::DownloadVideo { url, metadata, .. } => {
+                    // Resume interrupted download
+                    info!("Resuming interrupted download for task {}", task_id);
+
+                    let url = url.clone();
+                    let download_metadata = metadata.clone();
+                    let config_clone = config.clone();
+
+                    // Send "Resuming download" notification
+                    let title_display = download_metadata.title.as_deref().unwrap_or("video");
+                    crate::common::send_notification(
+                        &url,
+                        &format!("Resuming download: {} 🔄", title_display),
+                        Some(3000),
+                        &config_clone,
+                    )
+                    .await;
+
+                    // Convert DownloadMetadata to GetNameMetadata for spawn_download_video_task
+                    let get_name_metadata = crate::task::GetNameMetadata {
+                        title: download_metadata.title.clone(),
+                        expected_size_bytes: download_metadata.expected_size_bytes,
+                        directory: download_metadata.directory.clone(),
+                    };
+
+                    // Save tasks after sending notification
+                    if let Err(e) = mgr.save_tasks() {
+                        error!("Failed to save tasks: {}", e);
+                    }
+
+                    let handle = tokio::spawn(async move {
+                        // Execute download (will resume from cache if fragments exist)
+                        let path = crate::task::spawn_download_video_task(
+                            url,
+                            get_name_metadata,
+                            config_clone,
+                        )
+                        .await?;
                         Ok(TaskOperationResult::DownloadComplete(path))
                     });
 

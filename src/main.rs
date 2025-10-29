@@ -19,6 +19,8 @@ use tracing::{info, warn};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
+use crate::common::send_notification;
+
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ClientRequest {
     Add { url: String },
@@ -156,7 +158,12 @@ pub struct Args {
 #[derive(Subcommand)]
 pub enum Command {
     #[command(about = "Start the daemon")]
-    Daemon,
+    Daemon {
+        #[arg(long, help = "Run daemon in a detached tmux session")]
+        tmux: bool,
+        #[arg(long, help = "Kill existing daemon before starting")]
+        kill: bool,
+    },
 }
 
 /// Parse comma-separated list of task IDs
@@ -546,15 +553,15 @@ pub fn load_queued_tasks() -> Result<QueuedTasks> {
 }
 
 /// Append a URL to the queued tasks file
-pub fn append_to_queued_tasks(url: String) -> Result<()> {
+pub async fn append_to_queued_tasks(url: String, config: &Config) -> Result<()> {
     let data_dir = get_data_dir();
     let queued_path = data_dir.join("queued_tasks.json");
 
     let mut queued = load_queued_tasks().unwrap_or_default();
-    queued.urls.push(url);
-
+    queued.urls.push(url.clone());
     let content = serde_json::to_string_pretty(&queued)?;
     std::fs::write(&queued_path, content)?;
+    send_notification(&url, &format!("Added {url} to queued tasks\ndaemon is not running 🤨"), timeout_ms, config)
 
     Ok(())
 }
@@ -847,15 +854,89 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = load_config_from_path(args.config.as_deref());
 
     match args.command {
-        Some(Command::Daemon) => {
-            // Run as daemon
-            init_tracing()?;
-            info!("Starting {} daemon", APP);
-            validate_ytdlp().await?;
-            validate_curl().await?;
-            validate_download_dir(&config.download_dir).await?;
+        Some(Command::Daemon { tmux, kill }) => {
+            // Handle --kill flag first (before --tmux processing)
+            if kill {
+                let binary_path =
+                    std::env::current_exe().expect("Failed to get current executable path");
 
-            daemon::run_daemon(config).await?;
+                println!("Killing existing daemon...");
+                let kill_status = std::process::Command::new(&binary_path)
+                    .arg("--kill")
+                    .status();
+
+                match kill_status {
+                    Ok(_) => {
+                        // Continue with daemon startup after kill
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: Failed to run kill command: {}", e);
+                    }
+                }
+            }
+
+            if tmux {
+                // Check if tmux session already exists
+                let check_status = std::process::Command::new("tmux")
+                    .args(["has-session", "-t", "tsp_ytdlp"])
+                    .stderr(std::process::Stdio::null())
+                    .status();
+
+                match check_status {
+                    Ok(status) if status.success() => {
+                        eprintln!("Error: tmux session 'tsp_ytdlp' already exists");
+                        eprintln!("Attach with: tmux attach -t tsp_ytdlp");
+                        std::process::exit(1);
+                    }
+                    Ok(_) => {
+                        // Session doesn't exist, create it
+                        println!("Launching daemon in session tsp_ytdlp");
+                        let binary_path =
+                            std::env::current_exe().expect("Failed to get current executable path");
+
+                        // Get all args except the binary name and filter out --tmux and --kill
+                        let filtered_args: Vec<String> = std::env::args()
+                            .skip(1)
+                            .filter(|arg| arg != "--tmux" && arg != "--kill")
+                            .collect();
+
+                        // Build tmux command
+                        let mut tmux_cmd = std::process::Command::new("tmux");
+                        tmux_cmd.args([
+                            "new-session",
+                            "-d",
+                            "-s",
+                            "tsp_ytdlp",
+                            "-n",
+                            "tsp-ytdlp daemon",
+                            "--",
+                        ]);
+                        tmux_cmd.arg(binary_path);
+                        tmux_cmd.args(&filtered_args);
+
+                        // Use exec to replace current process
+                        use std::os::unix::process::CommandExt;
+                        let err = tmux_cmd.exec();
+                        // If we get here, exec failed
+                        eprintln!("Failed to exec tmux: {}", err);
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("Error: Failed to check tmux session: {}", e);
+                        eprintln!("Is tmux installed?");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                // Run as daemon normally
+                init_tracing()?;
+                info!("Starting {} daemon", APP);
+                validate_ytdlp().await?;
+                validate_curl().await?;
+                validate_download_dir(&config.download_dir).await?;
+
+                daemon::run_daemon(config).await?;
+            }
         }
         None => {
             // Client mode
