@@ -104,24 +104,30 @@ impl Task {
                 };
 
                 // Spawn yt-dlp to get metadata
-                let result = Command::new("yt-dlp")
-                    .args([
-                        "--print",
-                        "filename",
-                        "--print",
-                        "filesize_approx",
-                        "--restrict-filename",
-                        "--ignore-config",
-                        "--no-playlist",
-                        "--simulate",
-                        "-o",
-                        output_template,
-                        url,
-                    ])
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .output()
-                    .await;
+                let mut cmd = Command::new("yt-dlp");
+                cmd.args([
+                    "--print",
+                    "filename",
+                    "--print",
+                    "filesize_approx",
+                    "--restrict-filename",
+                    "--ignore-config",
+                    "--no-playlist",
+                    "--simulate",
+                    "-o",
+                    output_template,
+                ]);
+
+                // Add cookies if available
+                if let Some(cookie_file) = get_cookie_file() {
+                    cmd.args(["--cookies", &cookie_file.to_string_lossy()]);
+                }
+
+                cmd.arg(url);
+                cmd.stdout(Stdio::piped());
+                cmd.stderr(Stdio::piped());
+
+                let result = cmd.output().await;
 
                 match result {
                     Ok(output) if output.status.success() => {
@@ -129,7 +135,7 @@ impl Task {
                         let lines: Vec<&str> = stdout.lines().collect();
 
                         if lines.len() >= 2 {
-                            let filename = lines[0].trim().to_string();
+                            let filename = lines[0].trim().trim_end_matches('.').to_string();
                             let filesize_str = lines[1].trim();
                             let expected_size_bytes = filesize_str.parse::<u64>().ok();
 
@@ -697,7 +703,19 @@ pub async fn spawn_download_video_task(
         "linear=1:120:2",
         "--continue",
         "--skip-unavailable-fragments",
+        "--parse-metadata",
+        "webpage_url:%(comment)s",
+        "--embed-metadata",
+        "--sponsorblock-mark",
+        "all",
+        "--sponsorblock-remove",
+        "sponsor,interaction",
     ]);
+
+    // Add cookies if available
+    if let Some(cookie_file) = get_cookie_file() {
+        cmd.args(["--cookies", &cookie_file.to_string_lossy()]);
+    }
 
     // Set cache directory as home path for downloads and temp for fragments
     cmd.args(["--paths", &format!("home:{}", unique_cache.display())]);
@@ -733,13 +751,36 @@ pub async fn spawn_download_video_task(
         temp_download_path.display()
     );
 
-    // Verify temp file exists
-    if !temp_download_path.exists() {
-        return Err(anyhow::anyhow!(
-            "Downloaded file not found in cache: {}",
-            temp_download_path.display()
-        ));
-    }
+    // Find the actual downloaded file (yt-dlp may normalize the filename)
+    // Search for video files starting with the title prefix
+    let actual_file = if temp_download_path.exists() {
+        temp_download_path.clone()
+    } else {
+        // Search for video files in cache directory that start with the title
+        let mut found_file: Option<PathBuf> = None;
+        if let Ok(mut entries) = tokio::fs::read_dir(&unique_cache).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                    // Check if it's a video file starting with our title
+                    if file_name.starts_with(title)
+                        && (file_name.ends_with(".mp4")
+                            || file_name.ends_with(".mkv")
+                            || file_name.ends_with(".webm")) {
+                        found_file = Some(path);
+                        break;
+                    }
+                }
+            }
+        }
+        found_file.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Downloaded file not found in cache. Expected: {}, searched in: {}",
+                temp_download_path.display(),
+                unique_cache.display()
+            )
+        })?
+    };
 
     // Ensure final destination directory exists
     if let Some(parent) = final_path.parent() {
@@ -749,16 +790,16 @@ pub async fn spawn_download_video_task(
     }
 
     // Move file from cache to final destination
-    info!("Moving file from cache to: {}", final_path.display());
-    if let Err(e) = tokio::fs::rename(&temp_download_path, &final_path).await {
+    info!("Moving file from {} to: {}", actual_file.display(), final_path.display());
+    if let Err(e) = tokio::fs::rename(&actual_file, &final_path).await {
         // If rename fails (different filesystems), try copy + delete
         warn!("Rename failed, trying copy: {}", e);
-        tokio::fs::copy(&temp_download_path, &final_path)
+        tokio::fs::copy(&actual_file, &final_path)
             .await
             .context("Failed to copy file to destination")?;
 
         // Successfully copied, clean up
-        let _ = tokio::fs::remove_file(&temp_download_path).await;
+        let _ = tokio::fs::remove_file(&actual_file).await;
         let _ = tokio::fs::remove_dir_all(&unique_cache).await;
     } else {
         // Successfully moved, clean up cache directory
@@ -810,4 +851,17 @@ async fn get_disk_space(path: &str) -> anyhow::Result<u32> {
         }
 
     anyhow::bail!("Failed to parse df output")
+}
+
+/// Get the cookie file from SOURCE/private/cookies.firefox-private.txt
+/// Returns Some(PathBuf) if the cookie file exists, None otherwise
+fn get_cookie_file() -> Option<PathBuf> {
+    let source_dir = std::env::var("SOURCE").ok()?;
+    let cookie_file = PathBuf::from(&source_dir).join("private/cookies.firefox-private.txt");
+
+    if cookie_file.exists() {
+        Some(cookie_file)
+    } else {
+        None
+    }
 }

@@ -602,8 +602,8 @@ pub async fn get_video_dir_for_url(url: &str, config: &Config) -> String {
     }
 
     // Check if custom script exists and is executable
-    let script_path = std::env::var("HOME")
-        .map(|home| format!("{home}/source/private/get_video_dir.sh"))
+    let script_path = std::env::var("SOURCE")
+        .map(|source| format!("{source}/private/get_video_dir.sh"))
         .unwrap_or_else(|_| "/tmp/nonexistent".to_string());
 
     let script_path_obj = std::path::Path::new(&script_path);
@@ -807,6 +807,18 @@ pub async fn validate_curl() -> Result<()> {
     }
 }
 
+pub fn validate_source_env() -> Result<()> {
+    tracing::debug!("Validating SOURCE environment variable...");
+
+    match std::env::var("SOURCE") {
+        Ok(source_path) => {
+            tracing::debug!("SOURCE environment variable set to: {}", source_path);
+            Ok(())
+        }
+        Err(_) => anyhow::bail!("SOURCE environment variable is not set"),
+    }
+}
+
 pub fn init_tracing() -> Result<()> {
     let base_dirs =
         BaseDirs::new().ok_or_else(|| anyhow::anyhow!("Could not determine base directories"))?;
@@ -931,9 +943,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 // Run as daemon normally
                 init_tracing()?;
                 info!("Starting {} daemon", APP);
+                validate_source_env()?;
                 validate_ytdlp().await?;
                 validate_curl().await?;
                 validate_download_dir(&config.download_dir).await?;
+
+                send_notification("daemon", "Starting daemon 😈", Some(2000), &config).await;
 
                 daemon::run_daemon(config).await?;
             }

@@ -13,6 +13,9 @@ cargo build --release
 
 BINARY_PATH="target/release/tsp_ytdlp"
 
+
+"$BINARY_PATH" --kill
+
 if [ ! -f "$BINARY_PATH" ]; then
     echo "Error: Binary not found at $BINARY_PATH"
     exit 1
