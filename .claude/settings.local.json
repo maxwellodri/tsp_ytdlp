@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(cargo lbuild:*)"
+      "Bash(cargo lbuild:*)",
+      "Bash(cargo lcheck:*)"
     ],
     "deny": [],
     "ask": []
