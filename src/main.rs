@@ -21,6 +21,13 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 
 use crate::common::send_notification;
 
+/// Expands ~/ and environment variables in a path string
+fn expand_path(path: &str) -> Result<String> {
+    let expanded = shellexpand::full(path)
+        .map_err(|e| anyhow::anyhow!("Failed to expand path '{}': {}", path, e))?;
+    Ok(expanded.to_string())
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ClientRequest {
     Add { url: String },
@@ -85,6 +92,9 @@ pub struct Config {
     pub cache_dir: String,        // Directory for temporary files (fragments, json, etc)
     pub throttle: Option<u32>,    // Download speed limit in KB/s, None = unlimited
     pub video_quality: String, // Video quality: "480p", "720p", "1080p", "1440p", "2160p", "best", or custom
+    pub video_dir_script: Option<String>, // Optional script to determine download directory per URL (supports ~/ and $VAR)
+    pub sponsorblock_mark: Option<String>, // SponsorBlock categories to mark (e.g. "all", "sponsor,intro")
+    pub sponsorblock_remove: Option<String>, // SponsorBlock categories to remove (e.g. "sponsor,interaction")
 }
 
 impl Default for Config {
@@ -101,6 +111,9 @@ impl Default for Config {
             cache_dir: default_cache_dir,      // Use XDG cache dir
             throttle: None,                    // Unlimited download speed by default
             video_quality: "720p".to_string(), // 720p default
+            video_dir_script: None,            // No script by default
+            sponsorblock_mark: Some("all".to_string()), // Mark all sponsor segments by default
+            sponsorblock_remove: Some("sponsor,interaction".to_string()), // Remove sponsor and interaction segments by default
         }
     }
 }
@@ -258,7 +271,7 @@ socket_path = "{}"
 # Disk space threshold in MB to keep in reserve
 disk_threshold = {}
 
-# Default directory for downloads (fallback when get_video_dir.sh doesn't provide one)
+# Default directory for downloads (fallback when video_dir_script doesn't provide one)
 download_dir = "{}"
 
 # Directory for temporary files (json, part files, etc)
@@ -271,7 +284,38 @@ should_notify_send = {}
 # throttle = 1500
 
 # Video quality setting: "480p", "720p", "1080p", "1440p", "2160p", "best", or custom format
+# Custom format uses yt-dlp format selection syntax (see https://github.com/yt-dlp/yt-dlp#format-selection)
+# Examples: "bestvideo[height<=1080]+bestaudio/best[height<=1080]"
+# These options are passed directly to yt-dlp's --format argument
 video_quality = "{}"
+
+# Optional script to determine download directory per URL
+# Note: ~ and shell variables (e.g. $HOME, $SOURCE) are automatically expanded
+# Example: video_dir_script = "$HOME/get_video_dir.sh"
+# The script receives the URL as an argument and should output the target directory
+# video_dir_script = "/path/to/get_video_dir.sh"
+#
+# Example script:
+# #!/usr/bin/env bash
+# url="$1"
+#
+# [ -z "$url" ] && exit 1
+#
+# if [[ "$url" == *"music.youtube.com"* ]]; then
+#     mkdir -p "$HOME/Music/download/"
+#     echo "$HOME/Music/download"
+#     exit 0
+# fi
+#
+# exit 0
+
+# SponsorBlock settings (set to empty string to disable)
+# Categories to mark in the video (comma-separated)
+# Available: sponsor, intro, outro, selfpromo, preview, filler, interaction, music_offtopic, poi_highlight, chapter, all
+sponsorblock_mark = "{}"
+
+# Categories to remove from the video (comma-separated)
+sponsorblock_remove = "{}"
 "#,
             APP,
             default_config.concurrent_downloads,
@@ -280,7 +324,9 @@ video_quality = "{}"
             default_config.download_dir,
             default_config.cache_dir,
             default_config.should_notify_send,
-            default_config.video_quality
+            default_config.video_quality,
+            default_config.sponsorblock_mark.as_ref().unwrap_or(&String::new()),
+            default_config.sponsorblock_remove.as_ref().unwrap_or(&String::new())
         );
 
         if let Err(e) = std::fs::write(&config_path, config_content) {
@@ -573,16 +619,25 @@ pub async fn cleanup_cache_for_url(url: &str, config: &Config) {
 
     // Compute URL hash
     let url_hash = format!("{:x}", md5::compute(url.as_bytes()));
-    let unique_cache = cache_dir.join(&url_hash);
 
-    // Remove cache directory if it exists
-    if unique_cache.exists() {
-        match tokio::fs::remove_dir_all(&unique_cache).await {
-            Ok(_) => {
-                info!("Cleaned up cache for URL: {}", url);
-            }
-            Err(e) => {
-                warn!("Failed to cleanup cache for URL {}: {}", url, e);
+    // Find cache directory by hash (supports both old {hash} and new {hash}-{title} format)
+    if let Ok(mut entries) = tokio::fs::read_dir(&cache_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
+                    if dir_name.starts_with(&url_hash) {
+                        match tokio::fs::remove_dir_all(&path).await {
+                            Ok(_) => {
+                                info!("Cleaned up cache for URL: {}", url);
+                            }
+                            Err(e) => {
+                                warn!("Failed to cleanup cache for URL {}: {}", url, e);
+                            }
+                        }
+                        return;
+                    }
+                }
             }
         }
     }
@@ -601,10 +656,21 @@ pub async fn get_video_dir_for_url(url: &str, config: &Config) -> String {
         return default_dir.clone();
     }
 
-    // Check if custom script exists and is executable
-    let script_path = std::env::var("SOURCE")
-        .map(|source| format!("{source}/private/get_video_dir.sh"))
-        .unwrap_or_else(|_| "/tmp/nonexistent".to_string());
+    // Check if custom script path is configured
+    let script_path = match &config.video_dir_script {
+        Some(path) => match expand_path(path) {
+            Ok(expanded) => expanded,
+            Err(e) => {
+                use tracing::error;
+                error!("Failed to expand script path '{}': {}, using default directory", path, e);
+                return default_dir.clone();
+            }
+        },
+        None => {
+            info!("No video_dir_script configured, using default directory: {}", default_dir);
+            return default_dir.clone();
+        }
+    };
 
     let script_path_obj = std::path::Path::new(&script_path);
 

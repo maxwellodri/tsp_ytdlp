@@ -10,6 +10,58 @@ use std::process::Stdio;
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
+
+/// Format bytes into human-readable size (KB, MB, GB)
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} bytes", bytes)
+    }
+}
+
+/// Sanitize a title for use in a directory name
+/// Removes/replaces special characters and limits length
+fn sanitize_title(title: &str) -> String {
+    title
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect::<String>()
+        .chars()
+        .take(100) // Limit to 100 characters
+        .collect()
+}
+
+/// Find cache directory by URL hash
+/// Searches for directories starting with {hash}
+async fn find_cache_dir_by_hash(cache_dir: &PathBuf, url_hash: &str) -> Option<PathBuf> {
+    if let Ok(mut entries) = tokio::fs::read_dir(cache_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
+                    if dir_name.starts_with(url_hash) {
+                        return Some(path);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskKind {
     Queued,
@@ -92,8 +144,8 @@ impl Task {
 
                 let url_clone = url.clone();
 
-                // Send notification with MD5-based notification ID (30s timeout)
-                send_notification(url, &format!("Processing: {} 🔄", url), Some(30000), config)
+                // Send notification with MD5-based notification ID (5s timeout)
+                send_notification(url, &format!("Processing: {} 🔄", url), Some(5000), config)
                     .await;
 
                 // Determine output template based on URL
@@ -142,9 +194,15 @@ impl Task {
                             // Get directory for this URL
                             let directory = get_video_dir_for_url(url, config).await;
 
+                            // Format the log output nicely
+                            let size_display = match expected_size_bytes {
+                                Some(bytes) => format!("{} ({} bytes)", format_bytes(bytes), bytes),
+                                None => "unknown".to_string(),
+                            };
+
                             info!(
-                                "GetName success: title={}, size={:?}, dir={}",
-                                filename, expected_size_bytes, directory
+                                "GetName completed: '{}' | Size: {} | Directory: {}",
+                                filename, size_display, directory
                             );
 
                             *self = Task::GetName {
@@ -275,8 +333,7 @@ impl Task {
                 // Check if this is a restart (cache directory with fragments exists)
                 let url_hash = format!("{:x}", md5::compute(url.as_bytes()));
                 let cache_dir = PathBuf::from(&config.cache_dir);
-                let unique_cache = cache_dir.join(&url_hash);
-                let is_restart = unique_cache.exists();
+                let is_restart = find_cache_dir_by_hash(&cache_dir, &url_hash).await.is_some();
 
                 // Send notification with title (different message for restart vs fresh download)
                 let title_display = title.as_deref().unwrap_or("video");
@@ -664,9 +721,11 @@ pub async fn spawn_download_video_task(
     // Determine cache directory for download
     let cache_dir = PathBuf::from(&config.cache_dir);
 
-    // Create unique cache directory for this URL
+    // Create unique cache directory for this URL with human-readable name
     let url_hash = format!("{:x}", md5::compute(url.as_bytes()));
-    let unique_cache = cache_dir.join(&url_hash);
+    let sanitized_title = sanitize_title(title);
+    let cache_dir_name = format!("{}-{}", url_hash, sanitized_title);
+    let unique_cache = cache_dir.join(&cache_dir_name);
 
     tokio::fs::create_dir_all(&unique_cache)
         .await
@@ -706,11 +765,19 @@ pub async fn spawn_download_video_task(
         "--parse-metadata",
         "webpage_url:%(comment)s",
         "--embed-metadata",
-        "--sponsorblock-mark",
-        "all",
-        "--sponsorblock-remove",
-        "sponsor,interaction",
     ]);
+
+    // Add SponsorBlock options from config
+    if let Some(mark) = &config.sponsorblock_mark {
+        if !mark.is_empty() {
+            cmd.args(["--sponsorblock-mark", mark]);
+        }
+    }
+    if let Some(remove) = &config.sponsorblock_remove {
+        if !remove.is_empty() {
+            cmd.args(["--sponsorblock-remove", remove]);
+        }
+    }
 
     // Add cookies if available
     if let Some(cookie_file) = get_cookie_file() {
