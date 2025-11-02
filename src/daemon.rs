@@ -530,12 +530,11 @@ async fn task_processor_loop(manager: Arc<Mutex<TaskManager>>, config: Config) {
         }
 
         // Check if we can spawn more tasks
-        // Concurrent downloads limit: 0 = unlimited, N = max N simultaneous downloads
+        // Concurrent downloads limit: None = unlimited, Some(N) = max N simultaneous downloads
         let mut mgr = manager.lock().await;
-        let concurrent_limit = if config.concurrent_downloads == 0 {
-            usize::MAX
-        } else {
-            config.concurrent_downloads as usize
+        let concurrent_limit = match config.concurrent_downloads {
+            None => usize::MAX,
+            Some(n) => n.get() as usize,
         };
 
         // Enforce concurrency limit before spawning new tasks

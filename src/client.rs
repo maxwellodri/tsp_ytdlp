@@ -87,9 +87,12 @@ pub async fn run_client_status(verbose: bool, config: &Config, filter_failed: bo
             if verbose {
                 println!("\n=== tsp_ytdlp Status ===");
                 println!("Uptime: {}s", uptime_seconds);
+                let concurrent_display = config_summary.concurrent_downloads
+                    .map(|n| n.get().to_string())
+                    .unwrap_or_else(|| "unlimited".to_string());
                 println!(
                     "Config: {} concurrent downloads, {}MB disk threshold",
-                    config_summary.concurrent_downloads, config_summary.disk_threshold
+                    concurrent_display, config_summary.disk_threshold
                 );
                 println!();
             }
@@ -108,15 +111,15 @@ pub async fn run_client_status(verbose: bool, config: &Config, filter_failed: bo
 
                 // Print current downloads
                 if !current_tasks.is_empty() {
-                println!(
-                    "Current Downloads ({}/{}):",
-                    current_tasks.len(),
-                    if config_summary.concurrent_downloads == 0 {
-                        "".to_string()
-                    } else {
-                        config_summary.concurrent_downloads.to_string()
-                    }
-                );
+                    println!(
+                        "Current Downloads ({}{}):",
+                        current_tasks.len(),
+                        if let Some(concurrent_downloads) = config_summary.concurrent_downloads {
+                            format!("/{concurrent_downloads}") 
+                        } else {
+                            "".to_string()
+                        }
+                    );
                 for task in &current_tasks {
                     print!("  #{}: ", task.id);
 
@@ -181,12 +184,12 @@ pub async fn run_client_status(verbose: bool, config: &Config, filter_failed: bo
                 // Print current downloads
                 if !current_tasks.is_empty() {
                     println!(
-                        "Current Downloads ({}/{}):",
+                        "Current Downloads ({}{}):",
                         current_tasks.len(),
-                        if config_summary.concurrent_downloads == 0 {
-                            "".to_string()
+                        if let Some(concurrent_downloads) = config_summary.concurrent_downloads {
+                            format!("/{concurrent_downloads}") 
                         } else {
-                            config_summary.concurrent_downloads.to_string()
+                            "".to_string()
                         }
                     );
                     for task in &current_tasks {

@@ -10,7 +10,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use common::APP;
 use directories::{BaseDirs, ProjectDirs};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::process::Stdio;
 use task::{Task, TaskKind, Tasks};
@@ -21,6 +22,29 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 
 use crate::common::send_notification;
 
+/// Custom serde for concurrent_downloads: deserialize 0 as None, non-zero as Some(NonZeroU64)
+fn deserialize_concurrent_downloads<'de, D>(deserializer: D) -> Result<Option<NonZeroU64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = u64::deserialize(deserializer)?;
+    Ok(NonZeroU64::new(value))
+}
+
+/// Custom serde for concurrent_downloads: serialize None as 0, Some(n) as n
+fn serialize_concurrent_downloads<S>(
+    value: &Option<NonZeroU64>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match value {
+        None => serializer.serialize_u64(0),
+        Some(n) => serializer.serialize_u64(n.get()),
+    }
+}
+
 /// Expands ~/ and environment variables in a path string
 fn expand_path(path: &str) -> Result<String> {
     let expanded = shellexpand::full(path)
@@ -30,6 +54,8 @@ fn expand_path(path: &str) -> Result<String> {
 
 /// Generate default config file content from a Config struct
 pub fn generate_default_config_content(config: &Config) -> String {
+    let concurrent_downloads_val = config.concurrent_downloads.map(|n| n.get()).unwrap_or(0);
+
     format!(
         r#"# {} Configuration File
 # Number of concurrent downloads (0 = unlimited)
@@ -44,7 +70,7 @@ disk_threshold = {}
 # Default directory for downloads (fallback when video_dir_script doesn't provide one)
 download_dir = "{}"
 
-# Directory for temporary files (json, part files, etc)
+# Directory for temporary files (json metadata, part files, etc)
 cache_dir = "{}"
 
 # Whether to send desktop notifications (true/false)
@@ -88,7 +114,7 @@ sponsorblock_mark = "{}"
 sponsorblock_remove = "{}"
 "#,
         APP,
-        config.concurrent_downloads,
+        concurrent_downloads_val,
         config.socket_path,
         config.disk_threshold,
         config.download_dir,
@@ -151,7 +177,11 @@ pub struct TaskSummary {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ConfigSummary {
-    pub concurrent_downloads: u8,
+    #[serde(
+        serialize_with = "serialize_concurrent_downloads",
+        deserialize_with = "deserialize_concurrent_downloads"
+    )]
+    pub concurrent_downloads: Option<NonZeroU64>,
     pub disk_threshold: u32,
     pub socket_path: String,
 }
@@ -159,7 +189,11 @@ pub struct ConfigSummary {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
 pub struct Config {
-    pub concurrent_downloads: u8,
+    #[serde(
+        serialize_with = "serialize_concurrent_downloads",
+        deserialize_with = "deserialize_concurrent_downloads"
+    )]
+    pub concurrent_downloads: Option<NonZeroU64>,
     pub socket_path: String,
     pub disk_threshold: u32,                 // Megabytes to keep in reserve
     pub download_dir: String,                // Default directory for downloads
@@ -178,7 +212,7 @@ impl Default for Config {
         let default_download_dir = get_default_video_dir();
         let default_cache_dir = get_default_cache_dir();
         Self {
-            concurrent_downloads: 1,
+            concurrent_downloads: NonZeroU64::new(1),
             socket_path: default_socket_path,
             disk_threshold: 1024 * 2, // 2GB default
             download_dir: default_download_dir,
