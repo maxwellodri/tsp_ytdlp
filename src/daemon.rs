@@ -427,9 +427,9 @@ async fn task_processor_loop(manager: Arc<Mutex<TaskManager>>, config: Config) {
                 .filter(|(i, _)| *i != index)
                 .map(|(_, id)| *id)
                 .collect();
-            for (task_id, handle) in remaining_ids.into_iter().zip(remaining) {
+            remaining_ids.into_iter().zip(remaining).for_each(|(task_id, handle)| {
                 mgr.tasks.insert_active_task(task_id, handle);
-            }
+            });
 
             // Update task state based on result
             if let Some(task) = mgr.tasks.get_task_mut(completed_task_id) {
@@ -530,6 +530,7 @@ async fn task_processor_loop(manager: Arc<Mutex<TaskManager>>, config: Config) {
         }
 
         // Check if we can spawn more tasks
+        // Concurrent downloads limit: 0 = unlimited, N = max N simultaneous downloads
         let mut mgr = manager.lock().await;
         let concurrent_limit = if config.concurrent_downloads == 0 {
             usize::MAX
@@ -537,9 +538,10 @@ async fn task_processor_loop(manager: Arc<Mutex<TaskManager>>, config: Config) {
             config.concurrent_downloads as usize
         };
 
+        // Enforce concurrency limit before spawning new tasks
         if mgr.tasks.active_task_count() >= concurrent_limit {
             drop(mgr);
-            continue; // At capacity
+            continue; // At capacity, wait for a task to complete
         }
 
         // Find next task that needs processing
