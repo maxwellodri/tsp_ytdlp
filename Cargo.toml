@@ -20,6 +20,7 @@ chrono = { version = "0.4", features = ["serde"] }
 md5 = "0.7"
 atty = "0.2"
 futures = "0.3"
+shellexpand = "3.1"
 
 [dev-dependencies]
 tokio-test = "0.4"
