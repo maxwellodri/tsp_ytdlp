@@ -28,6 +28,81 @@ fn expand_path(path: &str) -> Result<String> {
     Ok(expanded.to_string())
 }
 
+/// Generate default config file content from a Config struct
+pub fn generate_default_config_content(config: &Config) -> String {
+    format!(
+        r#"# {} Configuration File
+# Number of concurrent downloads (0 = unlimited)
+concurrent_downloads = {}
+
+# Unix socket path for daemon communication
+socket_path = "{}"
+
+# Disk space threshold in MB to keep in reserve
+disk_threshold = {}
+
+# Default directory for downloads (fallback when video_dir_script doesn't provide one)
+download_dir = "{}"
+
+# Directory for temporary files (json, part files, etc)
+cache_dir = "{}"
+
+# Whether to send desktop notifications (true/false)
+should_notify_send = {}
+
+# Download speed throttle in KB/s (optional, unlimited if not set)
+# throttle = 1500
+
+# Video quality setting: "480p", "720p", "1080p", "1440p", "2160p", "best", or custom format
+# Custom format uses yt-dlp format selection syntax (see https://github.com/yt-dlp/yt-dlp#format-selection)
+# Examples: "bestvideo[height<=1080]+bestaudio/best[height<=1080]"
+# These options are passed directly to yt-dlp's --format argument
+video_quality = "{}"
+
+# Optional script to determine download directory per URL
+# Note: ~ and shell variables (e.g. $HOME, $SOURCE) are automatically expanded
+# Example: video_dir_script = "$HOME/get_video_dir.sh"
+# The script receives the URL as an argument and should output the target directory
+# video_dir_script = "/path/to/get_video_dir.sh"
+#
+# Example script:
+# #!/usr/bin/env bash
+# url="$1"
+#
+# [ -z "$url" ] && exit 1
+#
+# if [[ "$url" == *"music.youtube.com"* ]]; then
+#     mkdir -p "$HOME/Music/download/"
+#     echo "$HOME/Music/download"
+#     exit 0
+# fi
+#
+# exit 0
+
+# SponsorBlock settings (set to empty string to disable)
+# Categories to mark in the video (comma-separated)
+# Available: sponsor, intro, outro, selfpromo, preview, filler, interaction, music_offtopic, poi_highlight, chapter, all
+sponsorblock_mark = "{}"
+
+# Categories to remove from the video (comma-separated)
+sponsorblock_remove = "{}"
+"#,
+        APP,
+        config.concurrent_downloads,
+        config.socket_path,
+        config.disk_threshold,
+        config.download_dir,
+        config.cache_dir,
+        config.should_notify_send,
+        config.video_quality,
+        config.sponsorblock_mark.as_ref().unwrap_or(&String::new()),
+        config
+            .sponsorblock_remove
+            .as_ref()
+            .unwrap_or(&String::new())
+    )
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ClientRequest {
     Add { url: String },
@@ -81,16 +156,16 @@ pub struct ConfigSummary {
     pub socket_path: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
 pub struct Config {
     pub concurrent_downloads: u8,
     pub socket_path: String,
-    pub disk_threshold: u32,      // Megabytes to keep in reserve
-    pub download_dir: String,     // Default directory for downloads
-    pub should_notify_send: bool, // Whether to send desktop notifications
-    pub cache_dir: String,        // Directory for temporary files (fragments, json, etc)
-    pub throttle: Option<u32>,    // Download speed limit in KB/s, None = unlimited
+    pub disk_threshold: u32,                 // Megabytes to keep in reserve
+    pub download_dir: String,                // Default directory for downloads
+    pub should_notify_send: bool,            // Whether to send desktop notifications
+    pub cache_dir: String,                   // Directory for temporary files (fragments, json, etc)
+    pub throttle: Option<u32>,               // Download speed limit in KB/s, None = unlimited
     pub video_quality: String, // Video quality: "480p", "720p", "1080p", "1440p", "2160p", "best", or custom
     pub video_dir_script: Option<String>, // Optional script to determine download directory per URL (supports ~/ and $VAR)
     pub sponsorblock_mark: Option<String>, // SponsorBlock categories to mark (e.g. "all", "sponsor,intro")
@@ -107,11 +182,11 @@ impl Default for Config {
             socket_path: default_socket_path,
             disk_threshold: 1024 * 2, // 2GB default
             download_dir: default_download_dir,
-            should_notify_send: true,          // Default to enabled
-            cache_dir: default_cache_dir,      // Use XDG cache dir
-            throttle: None,                    // Unlimited download speed by default
-            video_quality: "720p".to_string(), // 720p default
-            video_dir_script: None,            // No script by default
+            should_notify_send: true,                   // Default to enabled
+            cache_dir: default_cache_dir,               // Use XDG cache dir
+            throttle: None,                             // Unlimited download speed by default
+            video_quality: "720p".to_string(),          // 720p default
+            video_dir_script: None,                     // No script by default
             sponsorblock_mark: Some("all".to_string()), // Mark all sponsor segments by default
             sponsorblock_remove: Some("sponsor,interaction".to_string()), // Remove sponsor and interaction segments by default
         }
@@ -152,7 +227,11 @@ pub struct Args {
     #[arg(short = 'k', long, help = "Kill the running daemon")]
     pub kill: bool,
 
-    #[arg(short = 'r', long, help = "Remove task(s) by ID (comma-separated for multiple)")]
+    #[arg(
+        short = 'r',
+        long,
+        help = "Remove task(s) by ID (comma-separated for multiple)"
+    )]
     pub remove: Option<String>,
 
     #[arg(long, help = "Show detailed info/logs for a task")]
@@ -179,7 +258,7 @@ pub enum Command {
     },
 }
 
-/// Parse comma-separated list of task IDs
+/// Parse comma-separated list of task IDs (command line arg)
 pub fn parse_id_list(input: &str) -> Result<Vec<u64>, String> {
     input
         .split(',')
@@ -260,74 +339,7 @@ pub fn load_config_from_path(custom_path: Option<&str>) -> Config {
     } else if custom_path.is_none() {
         // Only create default config file if using default path (not for custom configs)
         let default_config = Config::default();
-        let config_content = format!(
-            r#"# {} Configuration File
-# Number of concurrent downloads (0 = unlimited)
-concurrent_downloads = {}
-
-# Unix socket path for daemon communication
-socket_path = "{}"
-
-# Disk space threshold in MB to keep in reserve
-disk_threshold = {}
-
-# Default directory for downloads (fallback when video_dir_script doesn't provide one)
-download_dir = "{}"
-
-# Directory for temporary files (json, part files, etc)
-cache_dir = "{}"
-
-# Whether to send desktop notifications (true/false)
-should_notify_send = {}
-
-# Download speed throttle in KB/s (optional, unlimited if not set)
-# throttle = 1500
-
-# Video quality setting: "480p", "720p", "1080p", "1440p", "2160p", "best", or custom format
-# Custom format uses yt-dlp format selection syntax (see https://github.com/yt-dlp/yt-dlp#format-selection)
-# Examples: "bestvideo[height<=1080]+bestaudio/best[height<=1080]"
-# These options are passed directly to yt-dlp's --format argument
-video_quality = "{}"
-
-# Optional script to determine download directory per URL
-# Note: ~ and shell variables (e.g. $HOME, $SOURCE) are automatically expanded
-# Example: video_dir_script = "$HOME/get_video_dir.sh"
-# The script receives the URL as an argument and should output the target directory
-# video_dir_script = "/path/to/get_video_dir.sh"
-#
-# Example script:
-# #!/usr/bin/env bash
-# url="$1"
-#
-# [ -z "$url" ] && exit 1
-#
-# if [[ "$url" == *"music.youtube.com"* ]]; then
-#     mkdir -p "$HOME/Music/download/"
-#     echo "$HOME/Music/download"
-#     exit 0
-# fi
-#
-# exit 0
-
-# SponsorBlock settings (set to empty string to disable)
-# Categories to mark in the video (comma-separated)
-# Available: sponsor, intro, outro, selfpromo, preview, filler, interaction, music_offtopic, poi_highlight, chapter, all
-sponsorblock_mark = "{}"
-
-# Categories to remove from the video (comma-separated)
-sponsorblock_remove = "{}"
-"#,
-            APP,
-            default_config.concurrent_downloads,
-            default_config.socket_path,
-            default_config.disk_threshold,
-            default_config.download_dir,
-            default_config.cache_dir,
-            default_config.should_notify_send,
-            default_config.video_quality,
-            default_config.sponsorblock_mark.as_ref().unwrap_or(&String::new()),
-            default_config.sponsorblock_remove.as_ref().unwrap_or(&String::new())
-        );
+        let config_content = generate_default_config_content(&default_config);
 
         if let Err(e) = std::fs::write(&config_path, config_content) {
             eprintln!("Failed to create default config file: {e}");
@@ -607,7 +619,13 @@ pub async fn append_to_queued_tasks(url: String, config: &Config) -> Result<()> 
     queued.urls.push(url.clone());
     let content = serde_json::to_string_pretty(&queued)?;
     std::fs::write(&queued_path, content)?;
-    send_notification(&url, &format!("Added {url} to queued tasks\ndaemon is not running 🤨"), Some(3000), config).await;
+    send_notification(
+        &url,
+        &format!("Added {url} to queued tasks\ndaemon is not running 🤨"),
+        Some(3000),
+        config,
+    )
+    .await;
 
     Ok(())
 }
@@ -662,12 +680,18 @@ pub async fn get_video_dir_for_url(url: &str, config: &Config) -> String {
             Ok(expanded) => expanded,
             Err(e) => {
                 use tracing::error;
-                error!("Failed to expand script path '{}': {}, using default directory", path, e);
+                error!(
+                    "Failed to expand script path '{}': {}, using default directory",
+                    path, e
+                );
                 return default_dir.clone();
             }
         },
         None => {
-            info!("No video_dir_script configured, using default directory: {}", default_dir);
+            info!(
+                "No video_dir_script configured, using default directory: {}",
+                default_dir
+            );
             return default_dir.clone();
         }
     };

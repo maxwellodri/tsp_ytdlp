@@ -16,6 +16,9 @@ fn test_config() -> Config {
         cache_dir: "/tmp/tsp_ytdlp/cache".to_string(),
         throttle: Some(10), // 10 KB/s for testing
         video_quality: "720p".to_string(),
+        video_dir_script: None,
+        sponsorblock_mark: Some("all".to_string()),
+        sponsorblock_remove: Some("sponsor,interaction".to_string()),
     }
 }
 
