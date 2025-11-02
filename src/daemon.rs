@@ -1,3 +1,4 @@
+use crate::common::{send_notification, APP};
 use crate::task::TaskKind;
 use crate::{get_data_dir, ClientRequest, Config, ServerResponse, TaskManager};
 use anyhow::Result;
@@ -114,6 +115,9 @@ pub async fn run_daemon(config: Config) -> Result<()> {
             error!("Failed to save tasks on shutdown: {}", e);
         }
     }
+
+    // Send shutdown notification
+    send_notification(APP, "Daemon is dead 💀🥺", Some(1500), &config).await;
 
     // Clean up socket
     let _ = std::fs::remove_file(&socket_path_owned);
@@ -379,6 +383,9 @@ async fn process_request(
                     error!("Failed to save tasks during kill: {}", e);
                 }
             }
+
+            // Send shutdown notification
+            send_notification(APP, "Daemon is dead 💀🥺", Some(1500), &config).await;
 
             // Exit the process
             std::process::exit(0);
