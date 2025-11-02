@@ -243,6 +243,9 @@ pub struct Args {
     #[arg(long, help = "Show only failed tasks")]
     pub failed: bool,
 
+    #[arg(long, help = "Print default config to stdout and exit")]
+    pub print_default_config: bool,
+
     #[arg(long, global = true, help = "Path to custom config file")]
     pub config: Option<String>,
 }
@@ -953,6 +956,14 @@ pub fn init_tracing() -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
+
+    // Handle --print-default-config flag
+    if args.print_default_config {
+        let default_config = Config::default();
+        print!("{}", generate_default_config_content(&default_config));
+        return Ok(());
+    }
+
     let config = load_config_from_path(args.config.as_deref());
 
     match args.command {
