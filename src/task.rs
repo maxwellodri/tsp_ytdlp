@@ -1,5 +1,5 @@
 use crate::{
-    common::{send_critical_notification, send_notification},
+    common::{format_bytes, send_critical_notification, send_notification},
     get_video_dir_for_url, Config,
 };
 use anyhow::{Context, Result};
@@ -10,23 +10,6 @@ use std::process::Stdio;
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
-
-/// Format bytes into human-readable size (KB, MB, GB)
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-
-    if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.2} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.2} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} bytes", bytes)
-    }
-}
 
 /// Sanitize a title for use in a directory name
 /// Removes/replaces special characters and limits length
@@ -50,13 +33,11 @@ async fn find_cache_dir_by_hash(cache_dir: &PathBuf, url_hash: &str) -> Option<P
     if let Ok(mut entries) = tokio::fs::read_dir(cache_dir).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
-            if path.is_dir() {
-                if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
-                    if dir_name.starts_with(url_hash) {
+            if path.is_dir()
+                && let Some(dir_name) = path.file_name().and_then(|n| n.to_str())
+                    && dir_name.starts_with(url_hash) {
                         return Some(path);
                     }
-                }
-            }
         }
     }
     None
@@ -171,8 +152,8 @@ impl Task {
                 ]);
 
                 // Add cookies if available
-                if let Some(cookie_file) = get_cookie_file() {
-                    cmd.args(["--cookies", &cookie_file.to_string_lossy()]);
+                if let Some(cookie_file) = &config.cookies_file {
+                    cmd.args(["--cookies", cookie_file]);
                 }
 
                 cmd.arg(url);
@@ -768,20 +749,18 @@ pub async fn spawn_download_video_task(
     ]);
 
     // Add SponsorBlock options from config
-    if let Some(mark) = &config.sponsorblock_mark {
-        if !mark.is_empty() {
+    if let Some(mark) = &config.sponsorblock_mark
+        && !mark.is_empty() {
             cmd.args(["--sponsorblock-mark", mark]);
         }
-    }
-    if let Some(remove) = &config.sponsorblock_remove {
-        if !remove.is_empty() {
+    if let Some(remove) = &config.sponsorblock_remove
+        && !remove.is_empty() {
             cmd.args(["--sponsorblock-remove", remove]);
         }
-    }
 
     // Add cookies if available
-    if let Some(cookie_file) = get_cookie_file() {
-        cmd.args(["--cookies", &cookie_file.to_string_lossy()]);
+    if let Some(cookie_file) = &config.cookies_file {
+        cmd.args(["--cookies", cookie_file]);
     }
 
     // Set cache directory as home path for downloads and temp for fragments
@@ -918,17 +897,4 @@ async fn get_disk_space(path: &str) -> anyhow::Result<u32> {
         }
 
     anyhow::bail!("Failed to parse df output")
-}
-
-/// Get the cookie file from SOURCE/private/cookies.firefox-private.txt
-/// Returns Some(PathBuf) if the cookie file exists, None otherwise
-fn get_cookie_file() -> Option<PathBuf> {
-    let source_dir = std::env::var("SOURCE").ok()?;
-    let cookie_file = PathBuf::from(&source_dir).join("private/cookies.firefox-private.txt");
-
-    if cookie_file.exists() {
-        Some(cookie_file)
-    } else {
-        None
-    }
 }

@@ -52,6 +52,30 @@ fn expand_path(path: &str) -> Result<String> {
     Ok(expanded.to_string())
 }
 
+/// Custom serde for cookies_file: deserialize and expand ~/ and environment variables
+fn deserialize_cookies_file<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    match value {
+        Some(path) if !path.is_empty() => {
+            let expanded = expand_path(&path).map_err(serde::de::Error::custom)?;
+            Ok(Some(expanded))
+        }
+        Some(_) => Ok(None), // Empty string becomes None
+        None => Ok(None),
+    }
+}
+
+/// Custom serde for cookies_file: serialize as-is (already expanded)
+fn serialize_cookies_file<S>(value: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    value.serialize(serializer)
+}
+
 /// Generate default config file content from a Config struct
 pub fn generate_default_config_content(config: &Config) -> String {
     let concurrent_downloads_val = config.concurrent_downloads.map(|n| n.get()).unwrap_or(0);
@@ -112,6 +136,11 @@ sponsorblock_mark = "{}"
 
 # Categories to remove from the video (comma-separated)
 sponsorblock_remove = "{}"
+
+# Cookies file used by yt-dlp for authentication
+# Note: ~ and shell variables (e.g. $HOME, $SOURCE) are automatically expanded
+# Examples: cookies_file = "$HOME/cookies.txt" or cookies_file = "~/cookies.txt"
+cookies_file = "$HOME/cookies.txt"
 "#,
         APP,
         concurrent_downloads_val,
@@ -125,7 +154,7 @@ sponsorblock_remove = "{}"
         config
             .sponsorblock_remove
             .as_ref()
-            .unwrap_or(&String::new())
+            .unwrap_or(&String::new()),
     )
 }
 
@@ -173,6 +202,7 @@ pub struct TaskSummary {
     pub is_paused: bool,
     pub paused_reason: Option<String>,
     pub progress_percent: Option<f32>,
+    pub current_size_bytes: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -204,6 +234,11 @@ pub struct Config {
     pub video_dir_script: Option<String>, // Optional script to determine download directory per URL (supports ~/ and $VAR)
     pub sponsorblock_mark: Option<String>, // SponsorBlock categories to mark (e.g. "all", "sponsor,intro")
     pub sponsorblock_remove: Option<String>, // SponsorBlock categories to remove (e.g. "sponsor,interaction")
+    #[serde(
+        serialize_with = "serialize_cookies_file",
+        deserialize_with = "deserialize_cookies_file"
+    )]
+    pub cookies_file: Option<String>, // Used by yt-dlp for auth (supports ~/ and $VAR expansion)
 }
 
 impl Default for Config {
@@ -211,6 +246,12 @@ impl Default for Config {
         let default_socket_path = get_default_socket_path();
         let default_download_dir = get_default_video_dir();
         let default_cache_dir = get_default_cache_dir();
+
+        // Expand $HOME/cookies.txt to actual path for runtime use
+        let cookies_file = expand_path("$HOME/cookies.txt")
+            .ok()
+            .map(|s| s.to_string());
+
         Self {
             concurrent_downloads: NonZeroU64::new(1),
             socket_path: default_socket_path,
@@ -223,6 +264,7 @@ impl Default for Config {
             video_dir_script: None,                     // No script by default
             sponsorblock_mark: Some("all".to_string()), // Mark all sponsor segments by default
             sponsorblock_remove: Some("sponsor,interaction".to_string()), // Remove sponsor and interaction segments by default
+            cookies_file,
         }
     }
 }
@@ -506,6 +548,7 @@ impl TaskManager {
                 is_paused: false,
                 paused_reason: None,
                 progress_percent: self.get_task_progress(task),
+                current_size_bytes: self.get_task_current_size(task),
             };
 
             match task {
@@ -586,6 +629,65 @@ impl TaskManager {
                 } else {
                     None
                 }
+            }
+            _ => None,
+        }
+    }
+
+    fn get_task_current_size(&self, task: &Task) -> Option<u64> {
+        match task {
+            Task::DownloadVideo { url, .. } => {
+                // Calculate URL hash to find cache directory
+                let url_hash = format!("{:x}", md5::compute(url.as_bytes()));
+                let cache_dir = PathBuf::from(&self.config.cache_dir);
+
+                // Find cache directory by hash prefix
+                if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
+                                if dir_name.starts_with(&url_hash) {
+                                    // Sum up all file sizes in cache directory (excluding .json files)
+                                    let mut total_size = 0u64;
+                                    if let Ok(cache_entries) = std::fs::read_dir(&path) {
+                                        for cache_entry in cache_entries.flatten() {
+                                            let cache_path = cache_entry.path();
+                                            if cache_path.is_file() {
+                                                // Skip metadata files like .json
+                                                if let Some(ext) = cache_path.extension() {
+                                                    if ext == "json" {
+                                                        continue;
+                                                    }
+                                                }
+                                                if let Ok(metadata) = cache_entry.metadata() {
+                                                    total_size += metadata.len();
+                                                }
+                                            } else if cache_path.is_dir() {
+                                                // Also check subdirectories (e.g., fragments directory)
+                                                if let Ok(sub_entries) =
+                                                    std::fs::read_dir(&cache_path)
+                                                {
+                                                    for sub_entry in sub_entries.flatten() {
+                                                        if sub_entry.path().is_file() {
+                                                            if let Ok(metadata) =
+                                                                sub_entry.metadata()
+                                                            {
+                                                                total_size += metadata.len();
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    return Some(total_size);
+                                }
+                            }
+                        }
+                    }
+                }
+                None
             }
             _ => None,
         }

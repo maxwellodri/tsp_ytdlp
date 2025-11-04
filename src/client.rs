@@ -1,4 +1,4 @@
-use crate::{ClientRequest, Config, ServerResponse};
+use crate::{common::{format_bytes, send_notification, APP}, ClientRequest, Config, ServerResponse};
 use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -132,7 +132,15 @@ pub async fn run_client_status(verbose: bool, config: &Config, filter_failed: bo
 
                     // Show progress if available
                     if let Some(progress) = task.progress_percent {
-                        print!(" ({:.1}%)", progress);
+                        // Show percentage and current size
+                        if let Some(current_bytes) = task.current_size_bytes {
+                            print!(" ({:.1}%, {})", progress, format_bytes(current_bytes));
+                        } else {
+                            print!(" ({:.1}%)", progress);
+                        }
+                    } else if let Some(current_bytes) = task.current_size_bytes {
+                        // No total size, just show current size
+                        print!(" ({})", format_bytes(current_bytes));
                     } else {
                         print!(" ({})", task.task_type);
                     }
@@ -204,7 +212,15 @@ pub async fn run_client_status(verbose: bool, config: &Config, filter_failed: bo
 
                         // Show progress if available
                         if let Some(progress) = task.progress_percent {
-                            print!(" ({:.1}%)", progress);
+                            // Show percentage and current size
+                            if let Some(current_bytes) = task.current_size_bytes {
+                                print!(" ({:.1}%, {})", progress, format_bytes(current_bytes));
+                            } else {
+                                print!(" ({:.1}%)", progress);
+                            }
+                        } else if let Some(current_bytes) = task.current_size_bytes {
+                            // No total size, just show current size
+                            print!(" ({})", format_bytes(current_bytes));
                         } else {
                             print!(" ({})", task.task_type);
                         }
@@ -375,10 +391,12 @@ pub async fn run_client_kill(config: &Config) -> Result<()> {
     match send_request(request, config).await {
         Ok(ServerResponse::Success { message }) => {
             println!("{}", message);
+            send_notification(APP, "Daemon killed 💀", Some(1500), config).await;
         }
         Err(_) => {
             // Expected - daemon likely exited before responding
             println!("Daemon killed");
+            send_notification(APP, "Daemon killed 💀", Some(1500), config).await;
         }
         _ => {}
     }
