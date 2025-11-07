@@ -160,12 +160,14 @@ cookies_file = "$HOME/cookies.txt"
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ClientRequest {
-    Add { url: String },
+    Add { url: String, start_paused: bool },
     Remove { id: u64 },
     Clear,
     Status { verbose: bool },
     Kill { sender_pid: u32 },
     Info { id: u64 },
+    Pause { ids: Option<Vec<u64>> },
+    Resume { ids: Option<Vec<u64>> },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -324,6 +326,21 @@ pub struct Args {
 
     #[arg(long, global = true, help = "Path to custom config file")]
     pub config: Option<String>,
+
+    #[arg(
+        long,
+        help = "Pause task(s) by ID (comma-separated for multiple, or omit to pause all active)"
+    )]
+    pub pause: Option<Option<String>>,
+
+    #[arg(
+        long,
+        help = "Resume task(s) by ID (comma-separated for multiple, or omit to resume all paused)"
+    )]
+    pub resume: Option<Option<String>>,
+
+    #[arg(long, help = "Add URL as paused (use with URL argument)")]
+    pub paused: bool,
 }
 
 #[derive(Subcommand)]
@@ -518,6 +535,9 @@ impl TaskManager {
                     task::Task::Queued { .. } => TaskKind::Queued,
                     task::Task::GetName { .. } => TaskKind::GetName,
                     task::Task::DownloadVideo { .. } => TaskKind::DownloadVideo,
+                    task::Task::PausedQueued { .. } => TaskKind::PausedQueued,
+                    task::Task::PausedGetName { .. } => TaskKind::PausedGetName,
+                    task::Task::PausedDownloadVideo { .. } => TaskKind::PausedDownloadVideo,
                     task::Task::Completed { .. } => TaskKind::Completed,
                     task::Task::Failed { .. } => TaskKind::Failed,
                 };
@@ -545,15 +565,15 @@ impl TaskManager {
                 error: self.get_task_error(task),
                 timestamp: None,       // Could be enhanced later
                 elapsed_seconds: None, // Could be enhanced later
-                is_paused: false,
+                is_paused: task.is_paused(),
                 paused_reason: None,
                 progress_percent: self.get_task_progress(task),
                 current_size_bytes: self.get_task_current_size(task),
             };
 
             match task {
-                Task::Queued { .. } => queued_tasks.push(summary),
-                Task::GetName { .. } | Task::DownloadVideo { .. } => current_tasks.push(summary),
+                Task::Queued { .. } | Task::PausedQueued { .. } => queued_tasks.push(summary),
+                Task::GetName { .. } | Task::DownloadVideo { .. } | Task::PausedGetName { .. } | Task::PausedDownloadVideo { .. } => current_tasks.push(summary),
                 Task::Completed { .. } => completed_tasks.push(summary),
                 Task::Failed { .. } => failed_tasks.push(summary),
             }
@@ -577,15 +597,21 @@ impl TaskManager {
 
     fn get_task_title(&self, task: &Task) -> Option<String> {
         match task {
-            Task::GetName { metadata, .. } => metadata.as_ref().and_then(|m| m.title.clone()),
-            Task::DownloadVideo { metadata, .. } => metadata.title.clone(),
+            Task::GetName { metadata, .. } | Task::PausedGetName { metadata, .. } => {
+                metadata.as_ref().and_then(|m| m.title.clone())
+            }
+            Task::DownloadVideo { metadata, .. } | Task::PausedDownloadVideo { metadata, .. } => {
+                metadata.title.clone()
+            }
             _ => None,
         }
     }
 
     fn get_task_path(&self, task: &Task) -> Option<String> {
         match task {
-            Task::DownloadVideo { path, .. } => Some(path.to_string_lossy().to_string()),
+            Task::DownloadVideo { path, .. } | Task::PausedDownloadVideo { path, .. } => {
+                Some(path.to_string_lossy().to_string())
+            }
             Task::Completed { path, .. } => Some(path.to_string_lossy().to_string()),
             _ => None,
         }
@@ -596,6 +622,9 @@ impl TaskManager {
             Task::Queued { .. } => "Queued".to_string(),
             Task::GetName { .. } => "GetName".to_string(),
             Task::DownloadVideo { .. } => "DownloadVideo".to_string(),
+            Task::PausedQueued { .. } => "PausedQueued".to_string(),
+            Task::PausedGetName { .. } => "PausedGetName".to_string(),
+            Task::PausedDownloadVideo { .. } => "PausedDownloadVideo".to_string(),
             Task::Completed { .. } => "Completed".to_string(),
             Task::Failed { .. } => "Failed".to_string(),
         }
@@ -613,7 +642,8 @@ impl TaskManager {
 
     fn get_task_progress(&self, task: &Task) -> Option<f32> {
         match task {
-            Task::DownloadVideo { path, metadata, .. } => {
+            Task::DownloadVideo { path, metadata, .. }
+            | Task::PausedDownloadVideo { path, metadata, .. } => {
                 if let Some(expected_bytes) = metadata.expected_size_bytes {
                     // Try to get file size from various possible locations
                     let current_bytes = std::fs::metadata(path)
@@ -636,7 +666,7 @@ impl TaskManager {
 
     fn get_task_current_size(&self, task: &Task) -> Option<u64> {
         match task {
-            Task::DownloadVideo { url, .. } => {
+            Task::DownloadVideo { url, .. } | Task::PausedDownloadVideo { url, .. } => {
                 // Calculate URL hash to find cache directory
                 let url_hash = format!("{:x}", md5::compute(url.as_bytes()));
                 let cache_dir = PathBuf::from(&self.config.cache_dir);
@@ -691,6 +721,85 @@ impl TaskManager {
             }
             _ => None,
         }
+    }
+
+    pub fn pause_task(&mut self, id: u64) -> Result<(), String> {
+        if let Some(task) = self.tasks.get_task_mut(id) {
+            if task.is_paused() {
+                return Err("Task is already paused".to_string());
+            }
+            if matches!(task, Task::Completed { .. } | Task::Failed { .. }) {
+                return Err("Cannot pause completed or failed tasks".to_string());
+            }
+            task.pause();
+            Ok(())
+        } else {
+            Err(format!("Task {} not found", id))
+        }
+    }
+
+    pub fn resume_task(&mut self, id: u64) -> Result<(), String> {
+        if let Some(task) = self.tasks.get_task_mut(id) {
+            if !task.is_paused() {
+                return Err("Task is not paused".to_string());
+            }
+            task.unpause();
+            Ok(())
+        } else {
+            Err(format!("Task {} not found", id))
+        }
+    }
+
+    pub fn pause_all_active(&mut self) -> usize {
+        let active_ids: Vec<u64> = self
+            .tasks
+            .iter()
+            .filter_map(|(id, task)| {
+                if task.is_active() {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let count = active_ids.len();
+        for id in active_ids {
+            if let Some(task) = self.tasks.get_task_mut(id) {
+                task.pause();
+            }
+        }
+        count
+    }
+
+    pub fn resume_auto_resumable(&mut self) -> usize {
+        let auto_resumable_ids: Vec<u64> = self
+            .tasks
+            .iter()
+            .filter_map(|(id, task)| match task {
+                Task::PausedQueued {
+                    should_auto_resume: true,
+                    ..
+                }
+                | Task::PausedGetName {
+                    should_auto_resume: true,
+                    ..
+                }
+                | Task::PausedDownloadVideo {
+                    should_auto_resume: true,
+                    ..
+                } => Some(*id),
+                _ => None,
+            })
+            .collect();
+
+        let count = auto_resumable_ids.len();
+        for id in auto_resumable_ids {
+            if let Some(task) = self.tasks.get_task_mut(id) {
+                task.unpause();
+            }
+        }
+        count
     }
 
     pub fn clear_completed(&mut self) {
@@ -1127,7 +1236,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if tmux {
                 // Check if tmux session already exists
                 let check_status = std::process::Command::new("tmux")
-                    .args(["has-session", "-t", "tsp_ytdlp"])
+                    .args(["has-session", "-t", "=tsp_ytdlp"])
                     .stderr(std::process::Stdio::null())
                     .status();
 
@@ -1201,8 +1310,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 client::run_client_info(id, &config).await?;
             } else if args.clear {
                 client::run_client_clear(&config).await?;
+            } else if let Some(pause_arg) = args.pause {
+                // Handle --pause flag
+                let ids = match pause_arg {
+                    Some(id_str) => {
+                        let parsed = parse_id_list(&id_str).map_err(|e| anyhow::anyhow!(e))?;
+                        Some(parsed)
+                    }
+                    None => None, // Pause all active
+                };
+                client::run_client_pause(ids, &config).await?;
+            } else if let Some(resume_arg) = args.resume {
+                // Handle --resume flag
+                let ids = match resume_arg {
+                    Some(id_str) => {
+                        let parsed = parse_id_list(&id_str).map_err(|e| anyhow::anyhow!(e))?;
+                        Some(parsed)
+                    }
+                    None => None, // Resume all paused
+                };
+                client::run_client_resume(ids, &config).await?;
             } else if let Some(url) = args.url {
-                client::run_client_add(url, &config).await?;
+                client::run_client_add(url, args.paused, &config).await?;
             } else {
                 // Default: show status
                 if args.failed {

@@ -40,7 +40,7 @@ async fn send_request(request: ClientRequest, config: &Config) -> Result<ServerR
 }
 
 /// Add a task to the daemon
-pub async fn run_client_add(url: String, config: &Config) -> Result<()> {
+pub async fn run_client_add(url: String, start_paused: bool, config: &Config) -> Result<()> {
     // Check if daemon is active
     if !crate::is_daemon_active(config).await {
         // Daemon is not running, queue the task for next startup
@@ -50,7 +50,7 @@ pub async fn run_client_add(url: String, config: &Config) -> Result<()> {
     }
 
     // Daemon is running, send add request
-    let request = ClientRequest::Add { url };
+    let request = ClientRequest::Add { url, start_paused };
     let response = send_request(request, config).await?;
 
     match response {
@@ -145,6 +145,11 @@ pub async fn run_client_status(verbose: bool, config: &Config, filter_failed: bo
                         print!(" ({})", task.task_type);
                     }
 
+                    // Show (Paused) suffix if paused
+                    if task.is_paused {
+                        print!(" (Paused)");
+                    }
+
                     println!();
 
                     // Show path if verbose
@@ -223,6 +228,11 @@ pub async fn run_client_status(verbose: bool, config: &Config, filter_failed: bo
                             print!(" ({})", format_bytes(current_bytes));
                         } else {
                             print!(" ({})", task.task_type);
+                        }
+
+                        // Show (Paused) suffix if paused
+                        if task.is_paused {
+                            print!(" (Paused)");
                         }
 
                         println!();
@@ -428,6 +438,48 @@ pub async fn run_client_info(id: u64, config: &Config) -> Result<()> {
                 println!("(Log file does not exist yet)");
             }
 
+            Ok(())
+        }
+        ServerResponse::Error { message } => {
+            eprintln!("Error: {}", message);
+            std::process::exit(1);
+        }
+        _ => {
+            eprintln!("Unexpected response from daemon");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Pause task(s)
+pub async fn run_client_pause(ids: Option<Vec<u64>>, config: &Config) -> Result<()> {
+    let request = ClientRequest::Pause { ids };
+    let response = send_request(request, config).await?;
+
+    match response {
+        ServerResponse::Success { message } => {
+            println!("{}", message);
+            Ok(())
+        }
+        ServerResponse::Error { message } => {
+            eprintln!("Error: {}", message);
+            std::process::exit(1);
+        }
+        _ => {
+            eprintln!("Unexpected response from daemon");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Resume task(s)
+pub async fn run_client_resume(ids: Option<Vec<u64>>, config: &Config) -> Result<()> {
+    let request = ClientRequest::Resume { ids };
+    let response = send_request(request, config).await?;
+
+    match response {
+        ServerResponse::Success { message } => {
+            println!("{}", message);
             Ok(())
         }
         ServerResponse::Error { message } => {

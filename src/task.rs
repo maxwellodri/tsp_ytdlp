@@ -48,6 +48,9 @@ pub enum TaskKind {
     Queued,
     GetName,
     DownloadVideo,
+    PausedQueued,
+    PausedGetName,
+    PausedDownloadVideo,
     Completed,
     Failed,
 }
@@ -57,6 +60,9 @@ pub enum TaskStatus {
     Queued,
     GetName,
     DownloadVideo,
+    PausedQueued,
+    PausedGetName,
+    PausedDownloadVideo,
     Completed,
     Failed(String),
 }
@@ -74,6 +80,21 @@ pub enum Task {
         url: String,
         path: PathBuf,
         metadata: DownloadMetadata,
+    },
+    PausedQueued {
+        url: String,
+        should_auto_resume: bool,
+    },
+    PausedGetName {
+        url: String,
+        metadata: Option<GetNameMetadata>,
+        should_auto_resume: bool,
+    },
+    PausedDownloadVideo {
+        url: String,
+        path: PathBuf,
+        metadata: DownloadMetadata,
+        should_auto_resume: bool,
     },
     Completed {
         url: String,
@@ -108,6 +129,9 @@ impl Task {
             Task::Queued { url } => url,
             Task::GetName { url, .. } => url,
             Task::DownloadVideo { url, .. } => url,
+            Task::PausedQueued { url, .. } => url,
+            Task::PausedGetName { url, .. } => url,
+            Task::PausedDownloadVideo { url, .. } => url,
             Task::Completed { url, .. } => url,
             Task::Failed { url, .. } => url,
         }
@@ -117,7 +141,75 @@ impl Task {
         matches!(self, Task::GetName { .. } | Task::DownloadVideo { .. })
     }
 
+    pub fn is_paused(&self) -> bool {
+        matches!(
+            self,
+            Task::PausedQueued { .. }
+                | Task::PausedGetName { .. }
+                | Task::PausedDownloadVideo { .. }
+        )
+    }
+
+    /// Pause this task. Sets should_auto_resume to false (manual pause).
+    /// No-op if already paused, completed, or failed.
+    pub fn pause(&mut self) {
+        let paused = match self {
+            Task::Queued { url } => Task::PausedQueued {
+                url: url.clone(),
+                should_auto_resume: false,
+            },
+            Task::GetName { url, metadata } => Task::PausedGetName {
+                url: url.clone(),
+                metadata: metadata.clone(),
+                should_auto_resume: false,
+            },
+            Task::DownloadVideo {
+                url,
+                path,
+                metadata,
+            } => Task::PausedDownloadVideo {
+                url: url.clone(),
+                path: path.clone(),
+                metadata: metadata.clone(),
+                should_auto_resume: false,
+            },
+            // Already paused, completed, or failed - no-op
+            _ => return,
+        };
+        *self = paused;
+    }
+
+    /// Unpause this task. No-op if not paused.
+    pub fn unpause(&mut self) {
+        let unpaused = match self {
+            Task::PausedQueued { url, .. } => Task::Queued { url: url.clone() },
+            Task::PausedGetName { url, metadata, .. } => Task::GetName {
+                url: url.clone(),
+                metadata: metadata.clone(),
+            },
+            Task::PausedDownloadVideo {
+                url,
+                path,
+                metadata,
+                ..
+            } => Task::DownloadVideo {
+                url: url.clone(),
+                path: path.clone(),
+                metadata: metadata.clone(),
+            },
+            // Not paused - no-op
+            _ => return,
+        };
+        *self = unpaused;
+    }
+
     pub async fn transition(&mut self, next: TaskKind, context: Option<String>, config: &Config) {
+        // Paused tasks cannot transition - return early
+        if self.is_paused() {
+            warn!("Cannot transition paused task: {:?}", self);
+            return;
+        }
+
         match (&self, next) {
             // Queued → GetName: Fetch metadata using yt-dlp --simulate
             (Task::Queued { url }, TaskKind::GetName) => {
@@ -598,7 +690,66 @@ impl From<SerializableTasks> for Tasks {
                 info!("Recovered failed task {} for URL: {}", idx, task.url);
             });
 
-        // Priority 2: Add DownloadVideo tasks as Queued (will be re-promoted)
+        // Priority 2: Add Paused tasks (keep as paused with should_auto_resume: true for restart)
+        serializable
+            .tasks
+            .iter()
+            .filter(|task| matches!(task.task_kind, TaskKind::PausedQueued))
+            .for_each(|task| {
+                if !tasks.task_list.values().any(|t| t.url() == task.url) {
+                    let idx = tasks.index_counter;
+                    tasks.index_counter += 1;
+                    tasks.task_list.insert(
+                        idx,
+                        Task::PausedQueued {
+                            url: task.url.clone(),
+                            should_auto_resume: true,
+                        },
+                    );
+                    info!("Recovered paused queued task {} for URL: {}", idx, task.url);
+                }
+            });
+
+        serializable
+            .tasks
+            .iter()
+            .filter(|task| matches!(task.task_kind, TaskKind::PausedGetName))
+            .for_each(|task| {
+                if !tasks.task_list.values().any(|t| t.url() == task.url) {
+                    let idx = tasks.index_counter;
+                    tasks.index_counter += 1;
+                    tasks.task_list.insert(
+                        idx,
+                        Task::PausedGetName {
+                            url: task.url.clone(),
+                            metadata: None,
+                            should_auto_resume: true,
+                        },
+                    );
+                    info!("Recovered paused GetName task {} for URL: {}", idx, task.url);
+                }
+            });
+
+        serializable
+            .tasks
+            .iter()
+            .filter(|task| matches!(task.task_kind, TaskKind::PausedDownloadVideo))
+            .for_each(|task| {
+                if !tasks.task_list.values().any(|t| t.url() == task.url) {
+                    let idx = tasks.index_counter;
+                    tasks.index_counter += 1;
+                    tasks.task_list.insert(
+                        idx,
+                        Task::PausedQueued {
+                            url: task.url.clone(),
+                            should_auto_resume: true,
+                        },
+                    );
+                    info!("Recovered paused DownloadVideo task {} as PausedQueued for URL: {} (will re-fetch metadata)", idx, task.url);
+                }
+            });
+
+        // Priority 3: Add DownloadVideo tasks as Queued (will be re-promoted)
         serializable
             .tasks
             .iter()
@@ -612,7 +763,7 @@ impl From<SerializableTasks> for Tasks {
                 }
             });
 
-        // Priority 3: Add GetName tasks as Queued (will be re-promoted)
+        // Priority 4: Add GetName tasks as Queued (will be re-promoted)
         serializable
             .tasks
             .iter()
@@ -634,7 +785,7 @@ impl From<SerializableTasks> for Tasks {
                 }
             });
 
-        // Priority 4: Add Queued tasks
+        // Priority 5: Add Queued tasks
         serializable
             .tasks
             .iter()
@@ -668,6 +819,9 @@ impl From<Task> for SerializableTask {
             Task::Queued { .. } => TaskKind::Queued,
             Task::GetName { .. } => TaskKind::GetName,
             Task::DownloadVideo { .. } => TaskKind::DownloadVideo,
+            Task::PausedQueued { .. } => TaskKind::PausedQueued,
+            Task::PausedGetName { .. } => TaskKind::PausedGetName,
+            Task::PausedDownloadVideo { .. } => TaskKind::PausedDownloadVideo,
             Task::Completed { .. } => TaskKind::Completed,
             Task::Failed { .. } => TaskKind::Failed,
         };

@@ -187,7 +187,7 @@ async fn process_request(
     config: &Config,
 ) -> ServerResponse {
     match request {
-        ClientRequest::Add { url } => {
+        ClientRequest::Add { url, start_paused } => {
             let mut mgr = manager.lock().await;
 
             // Check for duplicate and handle failed task re-add
@@ -272,6 +272,13 @@ async fn process_request(
                     // No duplicate - add new task
                     match mgr.add_task(url.clone()) {
                         Ok(task_id) => {
+                            // If start_paused, pause the task immediately
+                            if start_paused {
+                                if let Some(task) = mgr.tasks.get_task_mut(task_id) {
+                                    task.pause();
+                                }
+                            }
+
                             // Save tasks
                             if let Err(e) = mgr.save_tasks() {
                                 error!("Failed to save tasks: {}", e);
@@ -280,18 +287,19 @@ async fn process_request(
                             // Send notification about new task
                             let url_clone = url.clone();
                             let config_clone = config.clone();
+                            let paused_suffix = if start_paused { " (paused)" } else { "" };
                             drop(mgr);
 
                             crate::common::send_notification(
                                 &url_clone,
-                                &format!("Task {} added for URL: {}", task_id, url_clone),
+                                &format!("Task {} added{} for URL: {}", task_id, paused_suffix, url_clone),
                                 Some(3000),
                                 &config_clone,
                             )
                             .await;
 
                             ServerResponse::Success {
-                                message: format!("Task {} added for URL: {}", task_id, url_clone),
+                                message: format!("Task {} added{} for URL: {}", task_id, paused_suffix, url_clone),
                             }
                         }
                         Err(e) => ServerResponse::Error {
@@ -369,6 +377,146 @@ async fn process_request(
             } else {
                 ServerResponse::Error {
                     message: format!("Task {} not found", id),
+                }
+            }
+        }
+
+        ClientRequest::Pause { ids } => {
+            let mut mgr = manager.lock().await;
+
+            match ids {
+                Some(id_list) => {
+                    // Pause specific tasks
+                    let mut success_count = 0;
+                    let mut errors = Vec::new();
+
+                    for id in id_list {
+                        match mgr.pause_task(id) {
+                            Ok(()) => {
+                                // Abort active task if it's running
+                                if mgr.tasks.has_active_task(id) {
+                                    mgr.tasks.abort_active_task(id);
+                                }
+                                success_count += 1;
+                            }
+                            Err(e) => errors.push(format!("Task {}: {}", id, e)),
+                        }
+                    }
+
+                    // Save tasks
+                    if let Err(e) = mgr.save_tasks() {
+                        error!("Failed to save tasks: {}", e);
+                    }
+
+                    if errors.is_empty() {
+                        ServerResponse::Success {
+                            message: format!("Paused {} task(s)", success_count),
+                        }
+                    } else {
+                        ServerResponse::Error {
+                            message: format!(
+                                "Paused {} task(s), errors: {}",
+                                success_count,
+                                errors.join("; ")
+                            ),
+                        }
+                    }
+                }
+                None => {
+                    // Pause all active tasks
+                    let count = mgr.pause_all_active();
+
+                    // Abort all active tasks
+                    let active_ids: Vec<u64> = mgr
+                        .tasks
+                        .iter()
+                        .filter_map(|(id, task)| {
+                            if task.is_paused() && mgr.tasks.has_active_task(*id) {
+                                Some(*id)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
+                    for id in active_ids {
+                        mgr.tasks.abort_active_task(id);
+                    }
+
+                    // Save tasks
+                    if let Err(e) = mgr.save_tasks() {
+                        error!("Failed to save tasks: {}", e);
+                    }
+
+                    ServerResponse::Success {
+                        message: format!("Paused {} active task(s)", count),
+                    }
+                }
+            }
+        }
+
+        ClientRequest::Resume { ids } => {
+            let mut mgr = manager.lock().await;
+
+            match ids {
+                Some(id_list) => {
+                    // Resume specific tasks
+                    let mut success_count = 0;
+                    let mut errors = Vec::new();
+
+                    for id in id_list {
+                        match mgr.resume_task(id) {
+                            Ok(()) => success_count += 1,
+                            Err(e) => errors.push(format!("Task {}: {}", id, e)),
+                        }
+                    }
+
+                    // Save tasks
+                    if let Err(e) = mgr.save_tasks() {
+                        error!("Failed to save tasks: {}", e);
+                    }
+
+                    if errors.is_empty() {
+                        ServerResponse::Success {
+                            message: format!("Resumed {} task(s)", success_count),
+                        }
+                    } else {
+                        ServerResponse::Error {
+                            message: format!(
+                                "Resumed {} task(s), errors: {}",
+                                success_count,
+                                errors.join("; ")
+                            ),
+                        }
+                    }
+                }
+                None => {
+                    // Resume all paused tasks (both manual and auto-resumable)
+                    let paused_ids: Vec<u64> = mgr
+                        .tasks
+                        .iter()
+                        .filter_map(|(id, task)| {
+                            if task.is_paused() {
+                                Some(*id)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
+                    let count = paused_ids.len();
+                    for id in paused_ids {
+                        let _ = mgr.resume_task(id);
+                    }
+
+                    // Save tasks
+                    if let Err(e) = mgr.save_tasks() {
+                        error!("Failed to save tasks: {}", e);
+                    }
+
+                    ServerResponse::Success {
+                        message: format!("Resumed {} paused task(s)", count),
+                    }
                 }
             }
         }
@@ -547,6 +695,11 @@ async fn task_processor_loop(manager: Arc<Mutex<TaskManager>>, config: Config) {
         let next_task = mgr.tasks.iter().find_map(|(id, task)| {
             if mgr.tasks.has_active_task(*id) {
                 return None; // Already being processed
+            }
+
+            // Skip paused tasks
+            if task.is_paused() {
+                return None;
             }
 
             match task {
