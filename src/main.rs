@@ -141,6 +141,12 @@ sponsorblock_remove = "{}"
 # Note: ~ and shell variables (e.g. $HOME, $SOURCE) are automatically expanded
 # Examples: cookies_file = "$HOME/cookies.txt" or cookies_file = "~/cookies.txt"
 cookies_file = "$HOME/cookies.txt"
+
+# Internet connectivity check interval in milliseconds (default: 10000 = 10 seconds)
+internet_poll_rate = {}
+
+# URL to check for internet connectivity (default: archlinux.org)
+internet_check_url = "{}"
 "#,
         APP,
         concurrent_downloads_val,
@@ -155,6 +161,8 @@ cookies_file = "$HOME/cookies.txt"
             .sponsorblock_remove
             .as_ref()
             .unwrap_or(&String::new()),
+        config.internet_poll_rate,
+        config.internet_check_url,
     )
 }
 
@@ -185,6 +193,8 @@ pub enum ServerResponse {
         failed_tasks: Vec<TaskSummary>,
         uptime_seconds: u64,
         config_summary: ConfigSummary,
+        has_internet: bool,
+        internet_check_url: String,
     },
     Info {
         log_file_path: String,
@@ -241,6 +251,8 @@ pub struct Config {
         deserialize_with = "deserialize_cookies_file"
     )]
     pub cookies_file: Option<String>, // Used by yt-dlp for auth (supports ~/ and $VAR expansion)
+    pub internet_poll_rate: u64,     // Interval in milliseconds to check internet connectivity (default 10000 = 10s)
+    pub internet_check_url: String,  // URL to check for internet connectivity (default "archlinux.org")
 }
 
 impl Default for Config {
@@ -267,6 +279,8 @@ impl Default for Config {
             sponsorblock_mark: Some("all".to_string()), // Mark all sponsor segments by default
             sponsorblock_remove: Some("sponsor,interaction".to_string()), // Remove sponsor and interaction segments by default
             cookies_file,
+            internet_poll_rate: 10000,                  // Check every 10 seconds (10000ms) by default
+            internet_check_url: "archlinux.org".to_string(), // Default to archlinux.org
         }
     }
 }
@@ -547,7 +561,7 @@ impl TaskManager {
         TaskByUrl::DoesntExist
     }
 
-    pub fn get_status(&self, _verbose: bool) -> ServerResponse {
+    pub fn get_status(&self, _verbose: bool, has_internet: bool, internet_check_url: &str) -> ServerResponse {
         let uptime_seconds = self.start_time.elapsed().as_secs();
 
         let mut queued_tasks = Vec::new();
@@ -592,6 +606,8 @@ impl TaskManager {
             failed_tasks,
             uptime_seconds,
             config_summary,
+            has_internet,
+            internet_check_url: internet_check_url.to_string(),
         }
     }
 

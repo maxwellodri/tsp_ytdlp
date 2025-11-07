@@ -82,6 +82,8 @@ pub async fn run_client_status(verbose: bool, config: &Config, filter_failed: bo
             failed_tasks,
             uptime_seconds,
             config_summary,
+            has_internet,
+            internet_check_url,
         } => {
             // Print header (only in verbose mode)
             if verbose {
@@ -94,6 +96,12 @@ pub async fn run_client_status(verbose: bool, config: &Config, filter_failed: bo
                     "Config: {} concurrent downloads, {}MB disk threshold",
                     concurrent_display, config_summary.disk_threshold
                 );
+                println!();
+            }
+
+            // Display internet connectivity status (only when offline)
+            if !has_internet {
+                println!("⚠️  No internet connection (checked: {})", internet_check_url);
                 println!();
             }
 
@@ -295,7 +303,14 @@ pub async fn run_client_failed(config: &Config) -> Result<()> {
     let response = send_request(request, config).await?;
 
     match response {
-        ServerResponse::Status { failed_tasks, .. } => {
+        ServerResponse::Status { failed_tasks, has_internet, internet_check_url, .. } => {
+            // Display internet connectivity status if offline
+            if !has_internet {
+                println!("⚠️  No internet connection (checked: {})", internet_check_url);
+                println!();
+            }
+
+
             if failed_tasks.is_empty() {
                 println!("No failed tasks");
                 return Ok(());

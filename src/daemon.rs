@@ -2,15 +2,77 @@ use crate::common::{send_notification, APP};
 use crate::task::TaskKind;
 use crate::{get_data_dir, ClientRequest, Config, ServerResponse, TaskManager};
 use anyhow::Result;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
 
+/// Check if internet is available by attempting to connect to the configured URL
+async fn check_internet_connectivity(url: &str) -> bool {
+    // Use curl with a 5-second timeout to check connectivity
+    match Command::new("curl")
+        .args([
+            "--silent",
+            "--head",
+            "--fail",
+            "--max-time",
+            "5",
+            url,
+        ])
+        .output()
+        .await
+    {
+        Ok(output) => {
+            let is_connected = output.status.success();
+            if !is_connected {
+                info!("Internet connectivity check failed for {}", url);
+            }
+            is_connected
+        }
+        Err(e) => {
+            warn!("Failed to execute curl for connectivity check: {}", e);
+            false
+        }
+    }
+}
+
+/// Background task that polls internet connectivity at regular intervals
+async fn internet_connectivity_loop(has_internet: Arc<AtomicBool>, config: Config) {
+    info!(
+        "Starting internet connectivity checker (polling {} every {}ms)",
+        config.internet_check_url, config.internet_poll_rate
+    );
+
+    loop {
+        let is_connected = check_internet_connectivity(&config.internet_check_url).await;
+        let was_connected = has_internet.load(Ordering::Relaxed);
+
+        // Update the atomic bool
+        has_internet.store(is_connected, Ordering::Relaxed);
+
+        // Log state changes
+        if is_connected != was_connected {
+            if is_connected {
+                info!("Internet connectivity restored");
+            } else {
+                warn!("Internet connectivity lost");
+            }
+        }
+
+        // Sleep for the configured interval
+        sleep(Duration::from_millis(config.internet_poll_rate)).await;
+    }
+}
+
 pub async fn run_daemon(config: Config) -> Result<()> {
     info!("Starting daemon with config: {:?}", config);
+
+    // Create internet connectivity tracker
+    let has_internet = Arc::new(AtomicBool::new(true)); // Assume connected initially
 
     // Load or create TaskManager
     let manager = Arc::new(Mutex::new(TaskManager::load_from_disk_with_config(None)?));
@@ -77,6 +139,15 @@ pub async fn run_daemon(config: Config) -> Result<()> {
     // Store socket path for cleanup later
     let socket_path_owned = socket_path.to_path_buf();
 
+    // Clone for the internet connectivity checker
+    let has_internet_clone = has_internet.clone();
+    let config_clone_internet = config.clone();
+
+    // Spawn internet connectivity checker loop
+    let internet_handle = tokio::spawn(async move {
+        internet_connectivity_loop(has_internet_clone, config_clone_internet).await;
+    });
+
     // Clone for the task processor
     let manager_clone = manager.clone();
     let config_clone = config.clone();
@@ -89,10 +160,11 @@ pub async fn run_daemon(config: Config) -> Result<()> {
     // Clone for the socket listener
     let manager_clone2 = manager.clone();
     let config_clone2 = config.clone();
+    let has_internet_clone2 = has_internet.clone();
 
     // Spawn socket listener loop
     let listener_handle = tokio::spawn(async move {
-        socket_listener_loop(manager_clone2, config_clone2, listener).await;
+        socket_listener_loop(manager_clone2, config_clone2, listener, has_internet_clone2).await;
     });
 
     // Wait for either task to complete (they shouldn't unless there's an error)
@@ -102,6 +174,9 @@ pub async fn run_daemon(config: Config) -> Result<()> {
         }
         _ = listener_handle => {
             warn!("Socket listener loop exited unexpectedly");
+        }
+        _ = internet_handle => {
+            warn!("Internet connectivity checker exited unexpectedly");
         }
         _ = tokio::signal::ctrl_c() => {
             info!("Received Ctrl+C, shutting down gracefully");
@@ -131,16 +206,18 @@ async fn socket_listener_loop(
     manager: Arc<Mutex<TaskManager>>,
     config: Config,
     listener: UnixListener,
+    has_internet: Arc<AtomicBool>,
 ) {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
                 let manager_clone = manager.clone();
                 let config_clone = config.clone();
+                let has_internet_clone = has_internet.clone();
 
                 // Spawn a task to handle this client
                 tokio::spawn(async move {
-                    if let Err(e) = handle_client(stream, manager_clone, config_clone).await {
+                    if let Err(e) = handle_client(stream, manager_clone, config_clone, has_internet_clone).await {
                         error!("Error handling client: {}", e);
                     }
                 });
@@ -157,6 +234,7 @@ async fn handle_client(
     mut stream: UnixStream,
     manager: Arc<Mutex<TaskManager>>,
     config: Config,
+    has_internet: Arc<AtomicBool>,
 ) -> Result<()> {
     // Read request from client
     let mut buffer = vec![0u8; 8192];
@@ -170,7 +248,7 @@ async fn handle_client(
     info!("Received request: {:?}", request);
 
     // Process request
-    let response = process_request(request, manager, &config).await;
+    let response = process_request(request, manager, &config, has_internet).await;
 
     // Send response
     let response_json = serde_json::to_vec(&response)?;
@@ -185,6 +263,7 @@ async fn process_request(
     request: ClientRequest,
     manager: Arc<Mutex<TaskManager>>,
     config: &Config,
+    has_internet: Arc<AtomicBool>,
 ) -> ServerResponse {
     match request {
         ClientRequest::Add { url, start_paused } => {
@@ -359,7 +438,8 @@ async fn process_request(
 
         ClientRequest::Status { verbose } => {
             let mgr = manager.lock().await;
-            mgr.get_status(verbose)
+            let is_connected = has_internet.load(Ordering::Relaxed);
+            mgr.get_status(verbose, is_connected, &config.internet_check_url)
         }
 
         ClientRequest::Info { id } => {
