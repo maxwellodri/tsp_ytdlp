@@ -250,9 +250,7 @@ impl Default for Config {
         let default_cache_dir = get_default_cache_dir();
 
         // Expand $HOME/cookies.txt to actual path for runtime use
-        let cookies_file = expand_path("$HOME/cookies.txt")
-            .ok()
-            .map(|s| s.to_string());
+        let cookies_file = expand_path("$HOME/cookies.txt").ok().map(|s| s.to_string());
 
         Self {
             concurrent_downloads: NonZeroU64::new(1),
@@ -573,7 +571,10 @@ impl TaskManager {
 
             match task {
                 Task::Queued { .. } | Task::PausedQueued { .. } => queued_tasks.push(summary),
-                Task::GetName { .. } | Task::DownloadVideo { .. } | Task::PausedGetName { .. } | Task::PausedDownloadVideo { .. } => current_tasks.push(summary),
+                Task::GetName { .. }
+                | Task::DownloadVideo { .. }
+                | Task::PausedGetName { .. }
+                | Task::PausedDownloadVideo { .. } => current_tasks.push(summary),
                 Task::Completed { .. } => completed_tasks.push(summary),
                 Task::Failed { .. } => failed_tasks.push(summary),
             }
@@ -754,13 +755,7 @@ impl TaskManager {
         let active_ids: Vec<u64> = self
             .tasks
             .iter()
-            .filter_map(|(id, task)| {
-                if task.is_active() {
-                    Some(*id)
-                } else {
-                    None
-                }
-            })
+            .filter_map(|(id, task)| if task.is_active() { Some(*id) } else { None })
             .collect();
 
         let count = active_ids.len();
@@ -1199,7 +1194,7 @@ pub fn init_tracing() -> Result<()> {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     // Handle --print-default-config flag
