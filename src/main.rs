@@ -22,6 +22,8 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 
 use crate::common::send_notification;
 
+const TMUX_SESSION: &str = "tsp_ytdlp_daemon";
+
 /// Custom serde for concurrent_downloads: deserialize 0 as None, non-zero as Some(NonZeroU64)
 fn deserialize_concurrent_downloads<'de, D>(deserializer: D) -> Result<Option<NonZeroU64>, D::Error>
 where
@@ -1231,19 +1233,19 @@ async fn main() -> anyhow::Result<()> {
             if tmux {
                 // Check if tmux session already exists
                 let check_status = std::process::Command::new("tmux")
-                    .args(["has-session", "-t", "=tsp_ytdlp"])
+                    .args(["has-session", "-t", format!("={TMUX_SESSION}").as_str()])
                     .stderr(std::process::Stdio::null())
                     .status();
 
                 match check_status {
                     Ok(status) if status.success() => {
-                        eprintln!("Error: tmux session 'tsp_ytdlp' already exists");
-                        eprintln!("Attach with: tmux attach -t tsp_ytdlp");
+                        eprintln!("Error: tmux session '{TMUX_SESSION}' already exists");
+                        eprintln!("Attach with: tmux attach -t {TMUX_SESSION}");
                         std::process::exit(1);
                     }
                     Ok(_) => {
                         // Session doesn't exist, create it
-                        println!("Launching daemon in session tsp_ytdlp");
+                        println!("Launching daemon in session {TMUX_SESSION}");
                         let binary_path =
                             std::env::current_exe().expect("Failed to get current executable path");
 
@@ -1259,7 +1261,7 @@ async fn main() -> anyhow::Result<()> {
                             "new-session",
                             "-d",
                             "-s",
-                            "tsp_ytdlp",
+                            TMUX_SESSION,
                             "-n",
                             "tsp-ytdlp daemon",
                             "--",
