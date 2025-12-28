@@ -1,5 +1,5 @@
-use tokio::process::Command;
 use crate::Config;
+use tokio::process::Command;
 
 pub const APP: &str = "tsp_ytdlp";
 
@@ -23,11 +23,7 @@ pub fn format_bytes(bytes: u64) -> String {
 }
 pub async fn send_critical_notification(url: &str, message: &str, config: &Config) {
     // Always log the notification message for testing validation
-    tracing::debug!(
-        "CRITICAL notification for URL '{}': {}",
-        url,
-        message
-    );
+    tracing::debug!("CRITICAL notification for URL '{}': {}", url, message);
 
     // Only execute the actual command if notifications are enabled
     if config.should_notify_send {
@@ -93,4 +89,11 @@ pub async fn send_notification(url: &str, message: &str, timeout_ms: Option<u32>
     } else {
         tracing::debug!("Notifications disabled in config, skipping notify-send command");
     }
+}
+
+/// Expands ~/ and environment variables in a path string
+pub fn expand_path(path: &str) -> anyhow::Result<String> {
+    let expanded = shellexpand::full(path)
+        .map_err(|e| anyhow::anyhow!("Failed to expand path '{}': {}", path, e))?;
+    Ok(expanded.to_string())
 }

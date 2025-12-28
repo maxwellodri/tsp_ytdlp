@@ -47,13 +47,6 @@ where
     }
 }
 
-/// Expands ~/ and environment variables in a path string
-fn expand_path(path: &str) -> Result<String> {
-    let expanded = shellexpand::full(path)
-        .map_err(|e| anyhow::anyhow!("Failed to expand path '{}': {}", path, e))?;
-    Ok(expanded.to_string())
-}
-
 /// Custom serde for cookies_file: deserialize and expand ~/ and environment variables
 fn deserialize_cookies_file<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
@@ -62,7 +55,7 @@ where
     let value = Option::<String>::deserialize(deserializer)?;
     match value {
         Some(path) if !path.is_empty() => {
-            let expanded = expand_path(&path).map_err(serde::de::Error::custom)?;
+            let expanded = common::expand_path(&path).map_err(serde::de::Error::custom)?;
             Ok(Some(expanded))
         }
         Some(_) => Ok(None), // Empty string becomes None
@@ -252,7 +245,9 @@ impl Default for Config {
         let default_cache_dir = get_default_cache_dir();
 
         // Expand $HOME/cookies.txt to actual path for runtime use
-        let cookies_file = expand_path("$HOME/cookies.txt").ok().map(|s| s.to_string());
+        let cookies_file = common::expand_path("$HOME/cookies.txt")
+            .ok()
+            .map(|s| s.to_string());
 
         Self {
             concurrent_downloads: NonZeroU64::new(1),
@@ -678,46 +673,44 @@ impl TaskManager {
                 if let Ok(entries) = std::fs::read_dir(&cache_dir) {
                     for entry in entries.flatten() {
                         let path = entry.path();
-                        if path.is_dir() {
-                            if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
-                                if dir_name.starts_with(&url_hash) {
-                                    // Sum up all file sizes in cache directory (excluding .json files)
-                                    let mut total_size = 0u64;
-                                    if let Ok(cache_entries) = std::fs::read_dir(&path) {
-                                        for cache_entry in cache_entries.flatten() {
-                                            let cache_path = cache_entry.path();
-                                            if cache_path.is_file() {
-                                                // Skip metadata files like .json
-                                                if let Some(ext) = cache_path.extension() {
-                                                    if ext == "json" {
-                                                        continue;
-                                                    }
-                                                }
-                                                if let Ok(metadata) = cache_entry.metadata() {
-                                                    total_size += metadata.len();
-                                                }
-                                            } else if cache_path.is_dir() {
-                                                // Also check subdirectories (e.g., fragments directory)
-                                                if let Ok(sub_entries) =
-                                                    std::fs::read_dir(&cache_path)
-                                                {
-                                                    for sub_entry in sub_entries.flatten() {
-                                                        if sub_entry.path().is_file() {
-                                                            if let Ok(metadata) =
-                                                                sub_entry.metadata()
-                                                            {
-                                                                total_size += metadata.len();
-                                                            }
-                                                        }
-                                                    }
-                                                }
+                        if !path.is_dir() {
+                            continue;
+                        }
+                        let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) else {
+                            continue;
+                        };
+                        if !dir_name.starts_with(&url_hash) {
+                            continue;
+                        }
+                        // Sum up all file sizes in cache directory (excluding .json files)
+                        let mut total_size = 0u64;
+                        if let Ok(cache_entries) = std::fs::read_dir(&path) {
+                            for cache_entry in cache_entries.flatten() {
+                                let cache_path = cache_entry.path();
+                                if cache_path.is_file() {
+                                    // Skip metadata files like .json
+                                    if let Some(ext) = cache_path.extension() && ext == "json" { 
+                                        continue;
+                                    }
+                                    else if let Ok(metadata) = cache_entry.metadata() {
+                                        total_size += metadata.len();
+                                    }
+                                } else if cache_path.is_dir() {
+                                    // Also check subdirectories (e.g., fragments directory)
+                                    if let Ok(sub_entries) = std::fs::read_dir(&cache_path) {
+                                        for sub_entry in sub_entries.flatten() {
+                                            if !sub_entry.path().is_file() {
+                                                continue;
+                                            }
+                                            if let Ok(metadata) = sub_entry.metadata() {
+                                                total_size += metadata.len();
                                             }
                                         }
                                     }
-                                    return Some(total_size);
                                 }
                             }
                         }
+                        return Some(total_size);
                     }
                 }
                 None
@@ -833,9 +826,7 @@ pub fn get_default_cache_dir() -> String {
 
 /// Check if the daemon is currently running by attempting to connect to its Unix socket
 pub async fn is_daemon_active(config: &Config) -> bool {
-    use tokio::net::UnixStream;
-    UnixStream::connect(&config.socket_path).await.is_ok()
-}
+    tokio::net::UnixStream::connect(&config.socket_path).await.is_ok() }
 
 /// Load queued tasks from disk
 pub fn load_queued_tasks() -> Result<QueuedTasks> {
@@ -887,165 +878,23 @@ pub async fn cleanup_cache_for_url(url: &str, config: &Config) {
     if let Ok(mut entries) = tokio::fs::read_dir(&cache_dir).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
-            if path.is_dir() {
-                if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
-                    if dir_name.starts_with(&url_hash) {
-                        match tokio::fs::remove_dir_all(&path).await {
-                            Ok(_) => {
-                                info!("Cleaned up cache for URL: {}", url);
-                            }
-                            Err(e) => {
-                                warn!("Failed to cleanup cache for URL {}: {}", url, e);
-                            }
-                        }
-                        return;
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+            if dir_name.starts_with(&url_hash) {
+                match tokio::fs::remove_dir_all(&path).await {
+                    Ok(_) => {
+                        info!("Cleaned up cache for URL: {}", url);
+                    }
+                    Err(e) => {
+                        warn!("Failed to cleanup cache for URL {}: {}", url, e);
                     }
                 }
+                return;
             }
         }
     }
-}
-
-pub async fn get_video_dir_for_url(url: &str, config: &Config) -> String {
-    // Use config's download_dir as default
-    let default_dir = &config.download_dir;
-
-    // For YouTube URLs, always use default
-    if url.contains("youtube.com") {
-        info!(
-            "YouTube URL detected, using default directory: {}",
-            default_dir
-        );
-        return default_dir.clone();
-    }
-
-    // Check if custom script path is configured
-    let script_path = match &config.video_dir_script {
-        Some(path) => match expand_path(path) {
-            Ok(expanded) => expanded,
-            Err(e) => {
-                use tracing::error;
-                error!(
-                    "Failed to expand script path '{}': {}, using default directory",
-                    path, e
-                );
-                return default_dir.clone();
-            }
-        },
-        None => {
-            info!(
-                "No video_dir_script configured, using default directory: {}",
-                default_dir
-            );
-            return default_dir.clone();
-        }
-    };
-
-    let script_path_obj = std::path::Path::new(&script_path);
-
-    // Check if script exists
-    if !script_path_obj.exists() {
-        info!(
-            "get_video_dir.sh not found at {}, using default directory: {}",
-            script_path, default_dir
-        );
-        return default_dir.clone();
-    }
-
-    // Check if script is executable (Unix permissions)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = script_path_obj.metadata() {
-            let permissions = metadata.permissions();
-            if permissions.mode() & 0o111 == 0 {
-                warn!(
-                    "get_video_dir.sh at {} is not executable, using default directory: {}",
-                    script_path, default_dir
-                );
-                return default_dir.clone();
-            }
-        }
-    }
-
-    // Try to execute the script
-    match TokioCommand::new(&script_path)
-        .arg(url)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-    {
-        Ok(output) => {
-            if output.status.success() {
-                let custom_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-                if !custom_dir.is_empty() && custom_dir != *default_dir {
-                    // Validate the path - must start with / or ~ or $HOME
-                    if custom_dir.starts_with('/')
-                        || custom_dir.starts_with('~')
-                        || custom_dir.starts_with("$HOME")
-                    {
-                        // Expand $HOME if present
-                        let expanded_dir = if custom_dir.starts_with("$HOME") {
-                            custom_dir.replace(
-                                "$HOME",
-                                &std::env::var("HOME")
-                                    .expect("HOME environment variable must be set"),
-                            )
-                        } else if custom_dir.starts_with('~') {
-                            custom_dir.replace(
-                                "~",
-                                &std::env::var("HOME")
-                                    .expect("HOME environment variable must be set"),
-                            )
-                        } else {
-                            custom_dir
-                        };
-
-                        // Try to create the directory
-                        match tokio::fs::create_dir_all(&expanded_dir).await {
-                            Ok(_) => {
-                                info!(
-                                    "Custom directory detected for URL: {} -> {}",
-                                    url, expanded_dir
-                                );
-                                return expanded_dir;
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Failed to create custom directory: {}, using default: {}",
-                                    e, default_dir
-                                );
-                            }
-                        }
-                    } else {
-                        warn!(
-                            "get_video_dir.sh returned invalid directory path: {}, using default",
-                            custom_dir
-                        );
-                    }
-                } else {
-                    info!("get_video_dir.sh returned empty/default result, using default directory for URL: {}", url);
-                }
-            } else {
-                let error = String::from_utf8_lossy(&output.stderr);
-                warn!(
-                    "get_video_dir.sh failed: {}, using default directory",
-                    error
-                );
-            }
-        }
-        Err(e) => {
-            warn!(
-                "Failed to execute get_video_dir.sh: {}, using default directory",
-                e
-            );
-        }
-    }
-
-    info!("Using default directory: {}", default_dir);
-    default_dir.clone()
 }
 
 pub fn get_progress_file_path(url: &str) -> String {
