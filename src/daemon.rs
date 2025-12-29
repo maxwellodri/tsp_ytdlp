@@ -611,7 +611,7 @@ async fn task_processor_loop(manager: Arc<Mutex<TaskManager>>, config: Config) {
                             .await;
 
                             // Touch the file to update timestamp
-                            if let Err(e) = crate::task::touch_file(&path).await {
+                            if let Err(e) = crate::task::fs::touch_file(&path).await {
                                 error!("Failed to touch completed file {}: {}", path.display(), e);
                             }
 

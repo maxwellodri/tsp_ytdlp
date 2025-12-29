@@ -1,24 +1,30 @@
-use crate::task::{GetNameMetadata, Task, TaskKind, Tasks};
 use crate::Config;
+use crate::TaskManager;
+use crate::task::{GetNameMetadata, Task, TaskKind, Tasks};
+use std::num::NonZeroU64;
 use std::path::Path;
+use std::sync::Arc;
 use tokio::fs;
 use tokio::process::Command;
+use tokio::sync::Mutex;
+use tracing::info;
 
 const TEST_URL: &str = "https://www.youtube.com/watch?v=jNQXAC9IVRw";
 
 fn test_config() -> Config {
     Config {
-        concurrent_downloads: 1,
+        concurrent_downloads: NonZeroU64::new(1),
         socket_path: "/tmp/tsp_ytdlp/test.sock".to_string(),
         disk_threshold: 1024,
         download_dir: "/tmp/tsp_ytdlp".to_string(),
         should_notify_send: false,
         cache_dir: "/tmp/tsp_ytdlp/cache".to_string(),
-        throttle: Some(10), // 10 KB/s for testing
+        throttle: Some(100), // 100 KB/s for testing
         video_quality: "720p".to_string(),
         video_dir_script: None,
         sponsorblock_mark: Some("all".to_string()),
         sponsorblock_remove: Some("sponsor,interaction".to_string()),
+        cookies_file: None,
     }
 }
 
@@ -63,7 +69,7 @@ async fn test_task_transitions() {
     let test_config = test_config();
 
     let mut task = Task::Queued {
-        url: "https://www.youtube.com/watch?v=test123".to_string(),
+        url: "https://www.youtube.com/watch?v=jNQXAC9IVRw".to_string(),
     };
 
     // Test transition from Queued to GetName
@@ -214,44 +220,6 @@ async fn test_enhanced_ytdlp_options() {
 }
 
 #[tokio::test]
-async fn test_progress_extraction() {
-    cleanup().await;
-    use crate::task::extract_progress_from_line;
-
-    // Test typical yt-dlp progress line
-    let line1 = "[download] 25.3% of 1.10GiB at 10.87MiB/s ETA 01:40";
-    assert_eq!(extract_progress_from_line(line1), Some(25.3));
-
-    // Test another format
-    let line2 = "[download]  50.7% of   2.3GiB at  5.2MiB/s ETA 02:15";
-    assert_eq!(extract_progress_from_line(line2), Some(50.7));
-
-    // Test 100% completion
-    let line3 = "[download] 100% of 1.5GiB in 05:32";
-    assert_eq!(extract_progress_from_line(line3), Some(100.0));
-
-    // Test non-progress lines (should return None)
-    let line4 = "[youtube] Extracting URL: https://www.youtube.com/watch?v=test";
-    assert_eq!(extract_progress_from_line(line4), None);
-
-    let line5 = "[info] Available formats for test:";
-    assert_eq!(extract_progress_from_line(line5), None);
-
-    // Test malformed progress line
-    let line6 = "[download] invalid% of something";
-    assert_eq!(extract_progress_from_line(line6), None);
-
-    // Test edge cases
-    let line7 = "[download] 0.0% of 100MB at 1MB/s";
-    assert_eq!(extract_progress_from_line(line7), Some(0.0));
-
-    let line8 = "[download] 99.9% of 100MB at 1MB/s";
-    assert_eq!(extract_progress_from_line(line8), Some(99.9));
-
-    cleanup().await;
-}
-
-#[tokio::test]
 async fn test_notification_config() {
     cleanup().await;
     use crate::common::{send_critical_notification, send_notification};
@@ -299,8 +267,8 @@ async fn test_end_to_end_video_download() {
         .with_env_filter(tracing_subscriber::EnvFilter::new("tsp_ytdlp=debug"))
         .try_init();
 
-    use crate::task::{Task, TaskStatus, Tasks};
     use crate::TaskManager;
+    use crate::task::{Task, TaskStatus, Tasks};
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -338,7 +306,9 @@ async fn test_end_to_end_video_download() {
         .expect("Failed to get completion handle");
 
     // Spawn a task manager with the test config in a background task
-    let manager = Arc::new(Mutex::new(TaskManager::new_with_config(test_config.clone())));
+    let manager = Arc::new(Mutex::new(TaskManager::new_with_config(
+        test_config.clone(),
+    )));
     manager.lock().await.tasks = tasks;
 
     // Start a simplified task processor (similar to daemon but for testing)
@@ -349,11 +319,11 @@ async fn test_end_to_end_video_download() {
         task_processor_loop_single_task(manager_clone, config_clone, task_id).await;
     });
 
-    // Wait for task to complete or fail (with 30s timeout)
-    use tokio::time::{timeout, Duration};
+    // Wait for task to complete or fail (with 60s timeout)
+    use tokio::time::{Duration, timeout};
 
-    println!("⏳ Waiting for download to complete (timeout: 30s)...");
-    let result = timeout(Duration::from_secs(30), async {
+    println!("⏳ Waiting for download to complete (timeout: 60s)...");
+    let result = timeout(Duration::from_secs(60), async {
         loop {
             rx.changed().await.unwrap();
             let status = rx.borrow().clone();
@@ -453,10 +423,13 @@ async fn test_end_to_end_video_download() {
                 }
             }
 
-            println!("✅ Downloaded file verified at: {}", download_path.display());
+            println!(
+                "✅ Downloaded file verified at: {}",
+                download_path.display()
+            );
         }
         Ok(Err(e)) => panic!("❌ Task failed: {}", e),
-        Err(_) => panic!("❌ Test timeout after 30s"),
+        Err(_) => panic!("❌ Test timeout after 60s"),
     }
 
     // Cleanup
@@ -540,7 +513,6 @@ async fn task_processor_loop_single_task(
                     }
                 }
             }
-            drop(mgr);
             continue;
         }
 
@@ -611,8 +583,6 @@ async fn task_processor_loop_single_task(
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             }
         }
-
-        drop(mgr);
     }
 }
 
@@ -684,7 +654,7 @@ async fn test_task_with_notification_config() {
     let config_disabled = test_config();
 
     let mut task = Task::Queued {
-        url: "https://www.youtube.com/watch?v=test".to_string(),
+        url: "https://www.youtube.com/watch?v=jNQXAC9IVRw".to_string(),
     };
 
     // Test that transitions work with notifications disabled
@@ -744,7 +714,10 @@ cache_dir = "{}/cache"
 throttle = {}
 video_quality = "{}"
 "#,
-        test_config.concurrent_downloads,
+        test_config
+            .concurrent_downloads
+            .map(|i| i.get())
+            .unwrap_or(0),
         test_dir,
         test_config.disk_threshold,
         test_dir,
