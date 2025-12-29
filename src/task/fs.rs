@@ -1,9 +1,9 @@
+use anyhow::{Context, Result};
 use std::{path::PathBuf, process::Stdio};
 use tokio::process::Command;
 use tracing::{info, warn};
-use anyhow::{Context, Result};
 
-use crate::{common::expand_path, Config};
+use crate::{Config, common::expand_path, task::MediaType};
 
 /// Find cache directory by URL hash
 /// Searches for directories starting with {hash}
@@ -13,9 +13,10 @@ pub async fn find_cache_dir_by_hash(cache_dir: &PathBuf, url_hash: &str) -> Opti
             let path = entry.path();
             if path.is_dir()
                 && let Some(dir_name) = path.file_name().and_then(|n| n.to_str())
-                    && dir_name.starts_with(url_hash) {
-                        return Some(path);
-                    }
+                && dir_name.starts_with(url_hash)
+            {
+                return Some(path);
+            }
         }
     }
     None
@@ -61,14 +62,15 @@ pub async fn get_disk_space(path: &str) -> anyhow::Result<u32> {
     let lines: Vec<&str> = output_str.lines().collect();
 
     if lines.len() >= 2
-        && let Ok(available_mb) = lines[1].trim().parse::<u32>() {
-            return Ok(available_mb);
-        }
+        && let Ok(available_mb) = lines[1].trim().parse::<u32>()
+    {
+        return Ok(available_mb);
+    }
 
     anyhow::bail!("Failed to parse df output")
 }
 
-pub async fn get_video_dir_for_url(url: &str, config: &Config) -> String {
+pub async fn get_video_dir_for_url(url: &str, config: &Config, media_type: MediaType) -> String {
     // Use config's download_dir as default
     let default_dir = &config.download_dir;
 
@@ -133,13 +135,30 @@ pub async fn get_video_dir_for_url(url: &str, config: &Config) -> String {
     }
 
     // Try to execute the script
-    match Command::new(&script_path)
-        .arg(url)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-    {
+    let script_output = match media_type {
+        MediaType::Video => {
+            // Backward compatible: pass just URL (1 arg)
+            Command::new(&script_path)
+                .arg(url)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .await
+        }
+        MediaType::Audio => {
+            // New feature: pass URL and media_type (2 args)
+            let media_kind = "audio";
+            Command::new(&script_path)
+                .arg(url)
+                .arg(media_kind)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .await
+        }
+    };
+
+    match script_output {
         Ok(output) => {
             if output.status.success() {
                 let custom_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -190,7 +209,10 @@ pub async fn get_video_dir_for_url(url: &str, config: &Config) -> String {
                         );
                     }
                 } else {
-                    info!("get_video_dir.sh returned empty/default result, using default directory for URL: {}", url);
+                    info!(
+                        "get_video_dir.sh returned empty/default result, using default directory for URL: {}",
+                        url
+                    );
                 }
             } else {
                 let error = String::from_utf8_lossy(&output.stderr);

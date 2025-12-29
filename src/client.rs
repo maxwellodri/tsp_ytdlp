@@ -1,4 +1,6 @@
-use crate::{common::{format_bytes, send_notification, APP}, ClientRequest, Config, ServerResponse};
+use crate::{
+    common::{format_bytes, send_notification, APP}, task::MediaType, ClientRequest, Config, ServerResponse
+};
 use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -8,8 +10,9 @@ async fn send_request(request: ClientRequest, config: &Config) -> Result<ServerR
     let socket_path = &config.socket_path;
 
     // Connect to Unix socket
-    let mut stream = UnixStream::connect(socket_path).await.map_err(|e| {
-        match e.kind() {
+    let mut stream = UnixStream::connect(socket_path)
+        .await
+        .map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
                 anyhow::anyhow!(
                     "Daemon is not running. Start it with: {} daemon",
@@ -19,8 +22,7 @@ async fn send_request(request: ClientRequest, config: &Config) -> Result<ServerR
                 )
             }
             _ => anyhow::anyhow!("Failed to connect to daemon: {}", e),
-        }
-    })?;
+        })?;
 
     // Serialize and send request
     let request_json = serde_json::to_vec(&request)?;
@@ -40,17 +42,17 @@ async fn send_request(request: ClientRequest, config: &Config) -> Result<ServerR
 }
 
 /// Add a task to the daemon
-pub async fn run_client_add(url: String, start_paused: bool, config: &Config) -> Result<()> {
+pub async fn run_client_add(url: String, media_type: MediaType, start_paused: bool, config: &Config) -> Result<()> {
     // Check if daemon is active
     if !crate::is_daemon_active(config).await {
         // Daemon is not running, queue the task for next startup
-        crate::append_to_queued_tasks(url.clone(), config).await?;
+        crate::append_to_queued_tasks(url.clone(), media_type, config).await?;
         println!("Daemon not running, queued for next startup: {}", url);
         return Ok(());
     }
 
     // Daemon is running, send add request
-    let request = ClientRequest::Add { url, start_paused };
+    let request = ClientRequest::Add { url, media_type, start_paused };
     let response = send_request(request, config).await?;
 
     match response {
@@ -87,7 +89,8 @@ pub async fn run_client_status(verbose: bool, config: &Config, filter_failed: bo
             if verbose {
                 println!("\n=== tsp_ytdlp Status ===");
                 println!("Uptime: {}s", uptime_seconds);
-                let concurrent_display = config_summary.concurrent_downloads
+                let concurrent_display = config_summary
+                    .concurrent_downloads
                     .map(|n| n.get().to_string())
                     .unwrap_or_else(|| "unlimited".to_string());
                 println!(
@@ -115,51 +118,50 @@ pub async fn run_client_status(verbose: bool, config: &Config, filter_failed: bo
                         "Current Downloads ({}{}):",
                         current_tasks.len(),
                         if let Some(concurrent_downloads) = config_summary.concurrent_downloads {
-                            format!("/{concurrent_downloads}") 
+                            format!("/{concurrent_downloads}")
                         } else {
                             "".to_string()
                         }
                     );
-                for task in &current_tasks {
-                    print!("  #{}: ", task.id);
+                    for task in &current_tasks {
+                        print!("  #{}: ", task.id);
 
-                    // Show title if available
-                    if let Some(ref title) = task.title {
-                        print!("{}", title);
-                    } else {
-                        print!("{}", task.url);
-                    }
-
-                    // Show progress if available
-                    if let Some(progress) = task.progress_percent {
-                        // Show percentage and current size
-                        if let Some(current_bytes) = task.current_size_bytes {
-                            print!(" ({:.1}%, {})", progress, format_bytes(current_bytes));
+                        // Show title if available
+                        if let Some(ref title) = task.title {
+                            print!("{}", title);
                         } else {
-                            print!(" ({:.1}%)", progress);
+                            print!("{}", task.url);
                         }
-                    } else if let Some(current_bytes) = task.current_size_bytes {
-                        // No total size, just show current size
-                        print!(" ({})", format_bytes(current_bytes));
-                    } else {
-                        print!(" ({})", task.task_type);
-                    }
 
-                    // Show (Paused) suffix if paused
-                    if task.is_paused {
-                        print!(" (Paused)");
-                    }
+                        // Show progress if available
+                        if let Some(progress) = task.progress_percent {
+                            // Show percentage and current size
+                            if let Some(current_bytes) = task.current_size_bytes {
+                                print!(" ({:.1}%, {})", progress, format_bytes(current_bytes));
+                            } else {
+                                print!(" ({:.1}%)", progress);
+                            }
+                        } else if let Some(current_bytes) = task.current_size_bytes {
+                            // No total size, just show current size
+                            print!(" ({})", format_bytes(current_bytes));
+                        } else {
+                            print!(" ({})", task.task_type);
+                        }
 
-                    println!();
+                        // Show (Paused) suffix if paused
+                        if task.is_paused {
+                            print!(" (Paused)");
+                        }
 
-                    // Show path if verbose
-                    if verbose
-                        && let Some(ref path) = task.path {
+                        println!();
+
+                        // Show path if verbose
+                        if verbose && let Some(ref path) = task.path {
                             println!("      Path: {}", path);
                         }
+                    }
+                    println!();
                 }
-                println!();
-            }
 
                 // Print completed tasks
                 if !completed_tasks.is_empty() {
@@ -200,7 +202,7 @@ pub async fn run_client_status(verbose: bool, config: &Config, filter_failed: bo
                         "Current Downloads ({}{}):",
                         current_tasks.len(),
                         if let Some(concurrent_downloads) = config_summary.concurrent_downloads {
-                            format!("/{concurrent_downloads}") 
+                            format!("/{concurrent_downloads}")
                         } else {
                             "".to_string()
                         }

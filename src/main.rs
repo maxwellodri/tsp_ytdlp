@@ -18,9 +18,9 @@ use task::{Task, TaskKind, Tasks};
 use tokio::process::Command as TokioCommand;
 use tracing::{info, warn};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
+use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::common::send_notification;
+use crate::{common::send_notification, task::MediaType};
 
 const TMUX_SESSION: &str = "tsp_ytdlp_daemon";
 
@@ -155,7 +155,7 @@ cookies_file = "$HOME/cookies.txt"
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ClientRequest {
-    Add { url: String, start_paused: bool },
+    Add { url: String, start_paused: bool, media_type: MediaType },
     Remove { id: u64 },
     Clear,
     Status { verbose: bool },
@@ -268,7 +268,7 @@ impl Default for Config {
 
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct QueuedTasks {
-    pub urls: Vec<String>,
+    pub urls: Vec<(String, MediaType)>,
 }
 
 #[derive(Debug)]
@@ -293,6 +293,8 @@ pub struct Args {
 
     #[arg(help = "URL to download")]
     pub url: Option<String>,
+    #[arg(long, help  = "Download audio only for this url")]
+    pub audio: bool,
 
     #[arg(short, long, help = "Show verbose status information")]
     pub verbose: bool,
@@ -499,8 +501,8 @@ impl TaskManager {
         })
     }
 
-    pub fn add_task(&mut self, url: String) -> Result<u64, String> {
-        self.tasks.add_url_as_task(url)
+    pub fn add_task(&mut self, url: String, media_type: MediaType) -> Result<u64, String> {
+        self.tasks.add_url_as_task(url, media_type)
     }
 
     pub fn remove_task(&mut self, id: u64) -> bool {
@@ -689,10 +691,11 @@ impl TaskManager {
                                 let cache_path = cache_entry.path();
                                 if cache_path.is_file() {
                                     // Skip metadata files like .json
-                                    if let Some(ext) = cache_path.extension() && ext == "json" { 
+                                    if let Some(ext) = cache_path.extension()
+                                        && ext == "json"
+                                    {
                                         continue;
-                                    }
-                                    else if let Ok(metadata) = cache_entry.metadata() {
+                                    } else if let Ok(metadata) = cache_entry.metadata() {
                                         total_size += metadata.len();
                                     }
                                 } else if cache_path.is_dir() {
@@ -826,7 +829,10 @@ pub fn get_default_cache_dir() -> String {
 
 /// Check if the daemon is currently running by attempting to connect to its Unix socket
 pub async fn is_daemon_active(config: &Config) -> bool {
-    tokio::net::UnixStream::connect(&config.socket_path).await.is_ok() }
+    tokio::net::UnixStream::connect(&config.socket_path)
+        .await
+        .is_ok()
+}
 
 /// Load queued tasks from disk
 pub fn load_queued_tasks() -> Result<QueuedTasks> {
@@ -847,12 +853,12 @@ pub fn load_queued_tasks() -> Result<QueuedTasks> {
 }
 
 /// Append a URL to the queued tasks file
-pub async fn append_to_queued_tasks(url: String, config: &Config) -> Result<()> {
+pub async fn append_to_queued_tasks(url: String, media_type: MediaType, config: &Config) -> Result<()> {
     let data_dir = get_data_dir();
     let queued_path = data_dir.join("queued_tasks.json");
 
     let mut queued = load_queued_tasks().unwrap_or_default();
-    queued.urls.push(url.clone());
+    queued.urls.push((url.clone(), media_type));
     let content = serde_json::to_string_pretty(&queued)?;
     std::fs::write(&queued_path, content)?;
     send_notification(
@@ -881,7 +887,9 @@ pub async fn cleanup_cache_for_url(url: &str, config: &Config) {
             if !path.is_dir() {
                 continue;
             }
-            let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+            let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
             if dir_name.starts_with(&url_hash) {
                 match tokio::fs::remove_dir_all(&path).await {
                     Ok(_) => {
@@ -1177,7 +1185,8 @@ async fn main() -> anyhow::Result<()> {
                 };
                 client::run_client_resume(ids, &config).await?;
             } else if let Some(url) = args.url {
-                client::run_client_add(url, args.paused, &config).await?;
+                let media_type = if args.audio { MediaType::Audio } else { MediaType::Video };
+                client::run_client_add(url, media_type, args.paused, &config).await?;
             } else {
                 // Default: show status
                 if args.failed {

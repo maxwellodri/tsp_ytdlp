@@ -1,4 +1,4 @@
-use crate::task::{Task, TaskKind, Tasks};
+use crate::task::{MediaType, Task, TaskKind, Tasks};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -7,6 +7,7 @@ use tracing::info;
 pub struct SerializableTask {
     pub url: String,
     pub task_kind: TaskKind,
+    pub media_type: MediaType,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -72,6 +73,7 @@ impl From<SerializableTasks> for Tasks {
                     Task::Failed {
                         url: task.url.clone(),
                         human_readable_error: "Recovered from previous session".to_string(),
+                        media_type: task.media_type,
                     },
                 );
                 info!("Recovered failed task {} for URL: {}", idx, task.url);
@@ -92,6 +94,7 @@ impl From<SerializableTasks> for Tasks {
                         Task::PausedQueued {
                             url: task.url.clone(),
                             should_auto_resume: true,
+                            media_type: task.media_type,
                         },
                     );
                     info!("Recovered paused queued task {} for URL: {}", idx, task.url);
@@ -112,6 +115,7 @@ impl From<SerializableTasks> for Tasks {
                             url: task.url.clone(),
                             metadata: None,
                             should_auto_resume: true,
+                            media_type: task.media_type,
                         },
                     );
                     info!(
@@ -134,6 +138,7 @@ impl From<SerializableTasks> for Tasks {
                         Task::PausedQueued {
                             url: task.url.clone(),
                             should_auto_resume: true,
+                            media_type: task.media_type
                         },
                     );
                     info!("Recovered paused DownloadVideo task {} as PausedQueued for URL: {} (will re-fetch metadata)", idx, task.url);
@@ -149,7 +154,7 @@ impl From<SerializableTasks> for Tasks {
                 if !tasks.task_list.values().any(|t| t.url() == task.url) {
                     let idx = tasks.index_counter;
                     tasks.index_counter += 1;
-                    tasks.task_list.insert(idx, Task::Queued { url: task.url.clone() });
+                    tasks.task_list.insert(idx, Task::Queued { url: task.url.clone(), media_type: task.media_type });
                     info!("Recovered DownloadVideo task {} as Queued for URL: {} (yt-dlp will resume from fragments)", idx, task.url);
                 }
             });
@@ -167,6 +172,7 @@ impl From<SerializableTasks> for Tasks {
                         idx,
                         Task::Queued {
                             url: task.url.clone(),
+                            media_type: task.media_type,
                         },
                     );
                     info!(
@@ -189,6 +195,7 @@ impl From<SerializableTasks> for Tasks {
                         idx,
                         Task::Queued {
                             url: task.url.clone(),
+                            media_type: task.media_type,
                         },
                     );
                     info!("Recovered queued task {} for URL: {}", idx, task.url);
@@ -220,6 +227,7 @@ impl From<Task> for SerializableTask {
         Self {
             url: task.url().to_string(),
             task_kind,
+            media_type: task.media_type(),
         }
     }
 }

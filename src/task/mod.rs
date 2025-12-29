@@ -1,10 +1,9 @@
 use crate::{
     common::{format_bytes, send_critical_notification, send_notification},
     task::fs::{find_cache_dir_by_hash, get_disk_space, get_video_dir_for_url},
-    Config
-
+    Config,
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -12,25 +11,25 @@ use std::process::Stdio;
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
-pub mod serialize;
+pub mod download;
 pub mod fs;
+pub mod serialize;
 
-/// Sanitize a title for use in a directory name
-/// Removes/replaces special characters and limits length
-fn sanitize_title(title: &str) -> String {
-    title
-        .chars()
-        .map(|c| match c {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            c if c.is_control() => '_',
-            c => c,
-        })
-        .collect::<String>()
-        .chars()
-        .take(100) // Limit to 100 characters
-        .collect()
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum MediaType {
+    #[default]
+    Video,
+    Audio,
 }
-
+impl std::fmt::Display for MediaType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let string = match self {
+            MediaType::Video => "Video",
+            MediaType::Audio => "Audio",
+        };
+        write!(f, "{}", string)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskKind {
@@ -60,26 +59,32 @@ pub enum TaskStatus {
 pub enum Task {
     Queued {
         url: String,
+        media_type: MediaType,
     },
     GetName {
         url: String,
         metadata: Option<GetNameMetadata>,
+        media_type: MediaType,
     },
     DownloadVideo {
         url: String,
         path: PathBuf,
+        media_type: MediaType,
         metadata: DownloadMetadata,
     },
     PausedQueued {
         url: String,
+        media_type: MediaType,
         should_auto_resume: bool,
     },
     PausedGetName {
         url: String,
         metadata: Option<GetNameMetadata>,
         should_auto_resume: bool,
+        media_type: MediaType,
     },
     PausedDownloadVideo {
+        media_type: MediaType,
         url: String,
         path: PathBuf,
         metadata: DownloadMetadata,
@@ -87,9 +92,11 @@ pub enum Task {
     },
     Completed {
         url: String,
+        media_type: MediaType,
         path: PathBuf,
     },
     Failed {
+        media_type: MediaType,
         url: String,
         human_readable_error: String,
     },
@@ -115,7 +122,7 @@ pub struct DownloadMetadata {
 impl Task {
     pub fn url(&self) -> &str {
         match self {
-            Task::Queued { url } => url,
+            Task::Queued { url, .. } => url,
             Task::GetName { url, .. } => url,
             Task::DownloadVideo { url, .. } => url,
             Task::PausedQueued { url, .. } => url,
@@ -143,24 +150,32 @@ impl Task {
     /// No-op if already paused, completed, or failed.
     pub fn pause(&mut self) {
         let paused = match self {
-            Task::Queued { url } => Task::PausedQueued {
+            Task::Queued { url, media_type } => Task::PausedQueued {
                 url: url.clone(),
+                media_type: *media_type,
                 should_auto_resume: false,
             },
-            Task::GetName { url, metadata } => Task::PausedGetName {
+            Task::GetName {
+                url,
+                metadata,
+                media_type,
+            } => Task::PausedGetName {
                 url: url.clone(),
                 metadata: metadata.clone(),
                 should_auto_resume: false,
+                media_type: *media_type,
             },
             Task::DownloadVideo {
                 url,
                 path,
                 metadata,
+                media_type,
             } => Task::PausedDownloadVideo {
                 url: url.clone(),
                 path: path.clone(),
                 metadata: metadata.clone(),
                 should_auto_resume: false,
+                media_type: *media_type,
             },
             // Already paused, completed, or failed - no-op
             _ => return,
@@ -171,20 +186,33 @@ impl Task {
     /// Unpause this task. No-op if not paused.
     pub fn unpause(&mut self) {
         let unpaused = match self {
-            Task::PausedQueued { url, .. } => Task::Queued { url: url.clone() },
-            Task::PausedGetName { url, metadata, .. } => Task::GetName {
+            Task::PausedQueued {
+                url, media_type, ..
+            } => Task::Queued {
+                url: url.clone(),
+                media_type: *media_type,
+            },
+            Task::PausedGetName {
+                url,
+                metadata,
+                media_type,
+                ..
+            } => Task::GetName {
                 url: url.clone(),
                 metadata: metadata.clone(),
+                media_type: *media_type,
             },
             Task::PausedDownloadVideo {
                 url,
                 path,
                 metadata,
+                media_type,
                 ..
             } => Task::DownloadVideo {
                 url: url.clone(),
                 path: path.clone(),
                 metadata: metadata.clone(),
+                media_type: *media_type,
             },
             // Not paused - no-op
             _ => return,
@@ -201,7 +229,7 @@ impl Task {
 
         match (&self, next) {
             // Queued → GetName: Fetch metadata using yt-dlp --simulate
-            (Task::Queued { url }, TaskKind::GetName) => {
+            (Task::Queued { url, media_type }, TaskKind::GetName) => {
                 info!("Transitioning task to GetName for URL: {}", url);
 
                 let url_clone = url.clone();
@@ -254,7 +282,7 @@ impl Task {
                             let expected_size_bytes = filesize_str.parse::<u64>().ok();
 
                             // Get directory for this URL
-                            let directory = get_video_dir_for_url(url, config).await;
+                            let directory = get_video_dir_for_url(url, config, *media_type).await;
 
                             // Format the log output nicely
                             let size_display = match expected_size_bytes {
@@ -263,12 +291,13 @@ impl Task {
                             };
 
                             info!(
-                                "GetName completed: '{}' | Size: {} | Directory: {}",
-                                filename, size_display, directory
+                                "GetName completed: '{}' | Size: {} | Directory: {} | Type: {:?}",
+                                filename, size_display, directory, media_type
                             );
 
                             *self = Task::GetName {
                                 url: url_clone,
+                                media_type: *media_type,
                                 metadata: Some(GetNameMetadata {
                                     title: Some(filename),
                                     expected_size_bytes,
@@ -287,6 +316,7 @@ impl Task {
                             *self = Task::Failed {
                                 url: url_clone,
                                 human_readable_error: error_msg,
+                                media_type: *media_type,
                             };
                         }
                     }
@@ -306,6 +336,7 @@ impl Task {
                         *self = Task::Failed {
                             url: url_clone,
                             human_readable_error: error_msg,
+                            media_type: *media_type,
                         };
                     }
                     Err(e) => {
@@ -320,13 +351,21 @@ impl Task {
                         *self = Task::Failed {
                             url: url_clone,
                             human_readable_error: error_msg,
+                            media_type: *media_type,
                         };
                     }
                 }
             }
 
             // GetName → DownloadVideo: Check disk space and start download
-            (Task::GetName { url, metadata }, TaskKind::DownloadVideo) => {
+            (
+                Task::GetName {
+                    url,
+                    metadata,
+                    media_type,
+                },
+                TaskKind::DownloadVideo,
+            ) => {
                 info!("Transitioning task to DownloadVideo for URL: {}", url);
 
                 let url_clone = url.clone();
@@ -337,6 +376,7 @@ impl Task {
                         *self = Task::Failed {
                             url: url_clone,
                             human_readable_error: "Missing metadata from GetName phase".to_string(),
+                            media_type: *media_type,
                         };
                         return;
                     }
@@ -357,6 +397,7 @@ impl Task {
                         *self = Task::Failed {
                             url: url_clone,
                             human_readable_error: error_msg,
+                            media_type: *media_type,
                         };
                         return;
                     }
@@ -378,6 +419,7 @@ impl Task {
                     *self = Task::Failed {
                         url: url_clone,
                         human_readable_error: error_msg,
+                        media_type: *media_type,
                     };
                     return;
                 }
@@ -395,7 +437,9 @@ impl Task {
                 // Check if this is a restart (cache directory with fragments exists)
                 let url_hash = format!("{:x}", md5::compute(url.as_bytes()));
                 let cache_dir = PathBuf::from(&config.cache_dir);
-                let is_restart = find_cache_dir_by_hash(&cache_dir, &url_hash).await.is_some();
+                let is_restart = find_cache_dir_by_hash(&cache_dir, &url_hash)
+                    .await
+                    .is_some();
 
                 // Send notification with title (different message for restart vs fresh download)
                 let title_display = title.as_deref().unwrap_or("video");
@@ -410,6 +454,7 @@ impl Task {
                     url: url_clone.clone(),
                     path: PathBuf::from(&directory)
                         .join(format!("{}.mp4", title.as_deref().unwrap_or("download"))),
+                    media_type: *media_type,
                     metadata: DownloadMetadata {
                         title: title.clone(),
                         expected_size_bytes: expected_size,
@@ -425,17 +470,27 @@ impl Task {
             }
 
             // DownloadVideo → Completed: This shouldn't happen in practice since we transition directly
-            (Task::DownloadVideo { url, path, .. }, TaskKind::Completed) => {
+            (
+                Task::DownloadVideo {
+                    url,
+                    path,
+                    media_type,
+                    ..
+                },
+                TaskKind::Completed,
+            ) => {
                 info!("Transitioning task to Completed for URL: {}", url);
                 *self = Task::Completed {
                     url: url.clone(),
                     path: path.clone(),
+                    media_type: *media_type,
                 };
             }
 
             // Any → Failed: Mark task as failed with error message
             (task, TaskKind::Failed) => {
                 let url = task.url().to_string();
+                let media_type = task.media_type();
                 let error_msg = context.unwrap_or_else(|| "Unknown error".to_string());
                 error!("Task failed for URL {}: {}", url, error_msg);
                 send_critical_notification(
@@ -447,6 +502,7 @@ impl Task {
                 *self = Task::Failed {
                     url,
                     human_readable_error: error_msg,
+                    media_type,
                 };
             }
 
@@ -457,6 +513,19 @@ impl Task {
                     self, next
                 );
             }
+        }
+    }
+
+    pub fn media_type(&self) -> MediaType {
+        match self {
+            Task::Queued { media_type, .. } => *media_type,
+            Task::GetName { media_type, .. } => *media_type,
+            Task::DownloadVideo { media_type, .. } => *media_type,
+            Task::PausedQueued { media_type, .. } => *media_type,
+            Task::PausedGetName { media_type, .. } => *media_type,
+            Task::PausedDownloadVideo { media_type, .. } => *media_type,
+            Task::Completed { media_type, .. } => *media_type,
+            Task::Failed { media_type, .. } => *media_type,
         }
     }
 }
@@ -542,8 +611,7 @@ impl Tasks {
         self.active_tasks.drain()
     }
 
-    pub fn add_url_as_task(&mut self, url: String) -> Result<u64, String> {
-        // Check for duplicate URLs
+    pub fn add_url_as_task(&mut self, url: String, media_type: MediaType) -> Result<u64, String> {
         for (existing_id, task) in self.task_list.iter() {
             if task.url() == url {
                 return Err(format!("URL already exists with task ID {}", existing_id));
@@ -554,7 +622,7 @@ impl Tasks {
         let task_id = self.index_counter;
         self.index_counter += 1;
 
-        let task = Task::Queued { url };
+        let task = Task::Queued { url, media_type };
         self.task_list.insert(task_id, task);
 
         // Initialize status channel
@@ -606,179 +674,3 @@ impl Tasks {
         self.status_channels.remove(&id);
     }
 }
-
-
-
-/// Spawn and execute a video download task
-/// Returns Ok(PathBuf) with final path on success, Err on failure
-pub async fn spawn_download_video_task(
-    url: String,
-    metadata: GetNameMetadata,
-    config: Config,
-) -> Result<PathBuf> {
-    let title = metadata.title.as_deref().unwrap_or("download");
-
-    // Construct final destination path
-    let final_path = PathBuf::from(&metadata.directory).join(format!("{}.mp4", title));
-
-    // Determine cache directory for download
-    let cache_dir = PathBuf::from(&config.cache_dir);
-
-    // Create unique cache directory for this URL with human-readable name
-    let url_hash = format!("{:x}", md5::compute(url.as_bytes()));
-    let sanitized_title = sanitize_title(title);
-    let cache_dir_name = format!("{}-{}", url_hash, sanitized_title);
-    let unique_cache = cache_dir.join(&cache_dir_name);
-
-    tokio::fs::create_dir_all(&unique_cache)
-        .await
-        .context("Failed to create cache directory")?;
-
-    // Temp download path in cache
-    let temp_download_path = unique_cache.join(format!("{}.mp4", title));
-
-    info!(
-        "Downloading to cache: {}\nWill move to: {}",
-        temp_download_path.display(),
-        final_path.display()
-    );
-
-    // Build yt-dlp download command
-    let mut cmd = Command::new("yt-dlp");
-    cmd.args([
-        "--newline",
-        "--progress",
-        "--restrict-filename",
-        "--trim-filenames",
-        "200",
-        "--ignore-config",
-        "--no-playlist",
-        "--merge-output-format",
-        "mp4",
-        "--format",
-        "best[height<=?720]",
-        "--retries",
-        "infinite",
-        "--fragment-retries",
-        "infinite",
-        "--retry-sleep",
-        "linear=1:120:2",
-        "--continue",
-        "--skip-unavailable-fragments",
-        "--parse-metadata",
-        "webpage_url:%(comment)s",
-        "--embed-metadata",
-    ]);
-
-    // Add SponsorBlock options from config
-    if let Some(mark) = &config.sponsorblock_mark
-        && !mark.is_empty() {
-            cmd.args(["--sponsorblock-mark", mark]);
-        }
-    if let Some(remove) = &config.sponsorblock_remove
-        && !remove.is_empty() {
-            cmd.args(["--sponsorblock-remove", remove]);
-        }
-
-    // Add cookies if available
-    if let Some(cookie_file) = &config.cookies_file {
-        cmd.args(["--cookies", cookie_file]);
-    }
-
-    // Set cache directory as home path for downloads and temp for fragments
-    cmd.args(["--paths", &format!("home:{}", unique_cache.display())]);
-    cmd.args([
-        "--paths",
-        &format!("temp:{}", unique_cache.join("fragments").display()),
-    ]);
-
-    // Add throttle if configured
-    if let Some(throttle_kb) = config.throttle {
-        cmd.args(["--limit-rate", &format!("{}K", throttle_kb)]);
-    }
-
-    // Set output filename
-    cmd.args(["-o", &format!("{}.mp4", title)]);
-    cmd.arg(&url);
-
-    // Spawn the download process
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
-    let output = cmd.output().await.context("Failed to spawn yt-dlp")?;
-
-    // Check exit status
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let error_msg = stderr.lines().next().unwrap_or("unknown error");
-        return Err(anyhow::anyhow!("yt-dlp failed: {}", error_msg));
-    }
-
-    info!(
-        "Download completed successfully to cache: {}",
-        temp_download_path.display()
-    );
-
-    // Find the actual downloaded file (yt-dlp may normalize the filename)
-    // Search for video files starting with the title prefix
-    let actual_file = if temp_download_path.exists() {
-        temp_download_path.clone()
-    } else {
-        // Search for video files in cache directory that start with the title
-        let mut found_file: Option<PathBuf> = None;
-        if let Ok(mut entries) = tokio::fs::read_dir(&unique_cache).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let path = entry.path();
-                if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                    // Check if it's a video file starting with our title
-                    if file_name.starts_with(title)
-                        && (file_name.ends_with(".mp4")
-                            || file_name.ends_with(".mkv")
-                            || file_name.ends_with(".webm")) {
-                        found_file = Some(path);
-                        break;
-                    }
-                }
-            }
-        }
-        found_file.ok_or_else(|| {
-            anyhow::anyhow!(
-                "Downloaded file not found in cache. Expected: {}, searched in: {}",
-                temp_download_path.display(),
-                unique_cache.display()
-            )
-        })?
-    };
-
-    // Ensure final destination directory exists
-    if let Some(parent) = final_path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .context("Failed to create destination directory")?;
-    }
-
-    // Move file from cache to final destination
-    info!("Moving file from {} to: {}", actual_file.display(), final_path.display());
-    if let Err(e) = tokio::fs::rename(&actual_file, &final_path).await {
-        // If rename fails (different filesystems), try copy + delete
-        warn!("Rename failed, trying copy: {}", e);
-        tokio::fs::copy(&actual_file, &final_path)
-            .await
-            .context("Failed to copy file to destination")?;
-
-        // Successfully copied, clean up
-        let _ = tokio::fs::remove_file(&actual_file).await;
-        let _ = tokio::fs::remove_dir_all(&unique_cache).await;
-    } else {
-        // Successfully moved, clean up cache directory
-        let _ = tokio::fs::remove_dir_all(&unique_cache).await;
-    }
-
-    info!(
-        "File successfully moved to final destination: {}",
-        final_path.display()
-    );
-
-    Ok(final_path)
-}
-
