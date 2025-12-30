@@ -1,5 +1,5 @@
 use crate::common::{APP, send_notification};
-use crate::task::TaskKind;
+use crate::task::{MediaType, TaskKind};
 use crate::{ClientRequest, Config, ServerResponse, TaskManager, get_data_dir};
 use anyhow::Result;
 use std::sync::Arc;
@@ -188,7 +188,11 @@ async fn process_request(
     config: &Config,
 ) -> ServerResponse {
     match request {
-        ClientRequest::Add { url, start_paused, media_type } => {
+        ClientRequest::Add {
+            url,
+            start_paused,
+            media_type,
+        } => {
             let mut mgr = manager.lock().await;
 
             // Check for duplicate and handle failed task re-add
@@ -273,7 +277,7 @@ async fn process_request(
                         Ok(task_id) => {
                             // If start_paused, pause the task immediately
                             if start_paused && let Some(task) = mgr.tasks.get_task_mut(task_id) {
-                                    task.pause();
+                                task.pause();
                             }
 
                             // Save tasks
@@ -584,18 +588,27 @@ async fn task_processor_loop(manager: Arc<Mutex<TaskManager>>, config: Config) {
                 match task_result {
                     Ok(Ok(TaskOperationResult::GetNameComplete(metadata))) => {
                         // GetName completed successfully - update task with metadata
-                        if let crate::task::Task::GetName { url, media_type, .. } = task {
+                        if let crate::task::Task::GetName {
+                            url, media_type, ..
+                        } = task
+                        {
                             info!("GetName completed for task {}", completed_task_id);
                             *task = crate::task::Task::GetName {
                                 url: url.clone(),
                                 metadata: Some(metadata),
-                                media_type: *media_type
+                                media_type: *media_type,
                             };
                         }
                     }
                     Ok(Ok(TaskOperationResult::DownloadComplete(path))) => {
                         // Download completed successfully
-                        if let crate::task::Task::DownloadVideo { url, metadata, media_type, .. } = task {
+                        if let crate::task::Task::DownloadVideo {
+                            url,
+                            metadata,
+                            media_type,
+                            ..
+                        } = task
+                        {
                             info!("Download completed for task {}", completed_task_id);
 
                             // Send completion notification with filename
@@ -662,7 +675,7 @@ async fn task_processor_loop(manager: Arc<Mutex<TaskManager>>, config: Config) {
                             *task = crate::task::Task::Failed {
                                 url,
                                 human_readable_error: error_msg.clone(),
-                                media_type
+                                media_type,
                             };
                             mgr.tasks.set_task_status(
                                 completed_task_id,
@@ -745,7 +758,10 @@ async fn task_processor_loop(manager: Arc<Mutex<TaskManager>>, config: Config) {
 
                     let handle = tokio::spawn(async move {
                         // Execute GetName operation
-                        let mut task = crate::task::Task::Queued { url: url.clone(), media_type};
+                        let mut task = crate::task::Task::Queued {
+                            url: url.clone(),
+                            media_type,
+                        };
                         task.transition(TaskKind::GetName, None, &config_clone)
                             .await;
 
@@ -765,7 +781,7 @@ async fn task_processor_loop(manager: Arc<Mutex<TaskManager>>, config: Config) {
                 crate::task::Task::GetName {
                     url,
                     metadata: Some(metadata),
-                    media_type
+                    media_type,
                 } => {
                     // Spawn DownloadVideo operation
                     let url = url.clone();
@@ -777,7 +793,7 @@ async fn task_processor_loop(manager: Arc<Mutex<TaskManager>>, config: Config) {
                         let mut temp_task = crate::task::Task::GetName {
                             url: url.clone(),
                             metadata: Some(metadata.clone()),
-                            media_type
+                            media_type,
                         };
                         temp_task
                             .transition(TaskKind::DownloadVideo, None, &config_clone)
@@ -792,15 +808,24 @@ async fn task_processor_loop(manager: Arc<Mutex<TaskManager>>, config: Config) {
 
                     let handle = tokio::spawn(async move {
                         // Execute download
-                        let path =
-                            crate::task::download::spawn_download_media_task(url, media_type, metadata, config_clone)
-                                .await?;
+                        let path = crate::task::download::spawn_download_media_task(
+                            url,
+                            media_type,
+                            metadata,
+                            config_clone,
+                        )
+                        .await?;
                         Ok(TaskOperationResult::DownloadComplete(path))
                     });
 
                     mgr.tasks.insert_active_task(task_id, handle);
                 }
-                crate::task::Task::DownloadVideo { url, metadata, media_type, .. } => {
+                crate::task::Task::DownloadVideo {
+                    url,
+                    metadata,
+                    media_type,
+                    ..
+                } => {
                     // Resume interrupted download
                     info!("Resuming interrupted download for task {}", task_id);
 
@@ -809,10 +834,14 @@ async fn task_processor_loop(manager: Arc<Mutex<TaskManager>>, config: Config) {
                     let config_clone = config.clone();
 
                     // Send "Resuming download" notification
-                    let title_display = download_metadata.title.as_deref().unwrap_or("video");
+                    let title_display = download_metadata.title.as_deref().unwrap_or("download");
+                    let media_emoji = match media_type {
+                        MediaType::Audio => "🎵",
+                        MediaType::Video => "🎬",
+                    };
                     crate::common::send_notification(
                         &url,
-                        &format!("Resuming download: {} 🔄", title_display),
+                        &format!("Resuming download: {} 🔄 {}", title_display, media_emoji),
                         Some(3000),
                         &config_clone,
                     )

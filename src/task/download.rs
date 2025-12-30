@@ -1,11 +1,11 @@
-use crate::task::MediaType;
-use crate::task::GetNameMetadata;
 use crate::Config;
+use crate::task::GetNameMetadata;
+use crate::task::MediaType;
+use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::process::Stdio;
-use anyhow::{Context, Result};
 use tokio::process::Command;
-use tracing::{warn, info};
+use tracing::{info, warn};
 
 /// Spawn and execute a video download task
 /// Returns Ok(PathBuf) with final path on success, Err on failure
@@ -17,8 +17,14 @@ pub async fn spawn_download_media_task(
 ) -> Result<PathBuf> {
     let title = metadata.title.as_deref().unwrap_or("download");
 
+    // Determine file extension based on media type
+    let file_ext = match media_type {
+        MediaType::Audio => "ogg",
+        MediaType::Video => "mp4",
+    };
+
     // Construct final destination path
-    let final_path = PathBuf::from(&metadata.directory).join(format!("{}.mp4", title));
+    let final_path = PathBuf::from(&metadata.directory).join(format!("{}.{}", title, file_ext));
 
     // Determine cache directory for download
     let cache_dir = PathBuf::from(&config.cache_dir);
@@ -34,7 +40,7 @@ pub async fn spawn_download_media_task(
         .context("Failed to create cache directory")?;
 
     // Temp download path in cache
-    let temp_download_path = unique_cache.join(format!("{}.mp4", title));
+    let temp_download_path = unique_cache.join(format!("{}.{}", title, file_ext));
 
     info!(
         "Downloading {} to cache: {}\nWill move to: {}",
@@ -53,10 +59,29 @@ pub async fn spawn_download_media_task(
         "200",
         "--ignore-config",
         "--no-playlist",
-        "--merge-output-format",
-        "mp4",
-        "--format",
-        "best[height<=?720]",
+    ]);
+
+    match media_type {
+        MediaType::Audio => {
+            cmd.args([
+                "--extract-audio",
+                "--audio-format",
+                "vorbis",
+                "--format",
+                "bestaudio/best",
+            ]);
+        }
+        MediaType::Video => {
+            cmd.args([
+                "--merge-output-format",
+                "mp4",
+                "--format",
+                "best[height<=?720]",
+            ]);
+        }
+    }
+
+    cmd.args([
         "--retries",
         "infinite",
         "--fragment-retries",
@@ -70,16 +95,25 @@ pub async fn spawn_download_media_task(
         "--embed-metadata",
     ]);
 
-    // Add SponsorBlock options from config
-    if let Some(mark) = &config.sponsorblock_mark
-        && !mark.is_empty()
-    {
-        cmd.args(["--sponsorblock-mark", mark]);
-    }
-    if let Some(remove) = &config.sponsorblock_remove
-        && !remove.is_empty()
-    {
-        cmd.args(["--sponsorblock-remove", remove]);
+    // Add SponsorBlock options
+    match media_type {
+        MediaType::Audio => {
+            // For audio, remove ALL sponsorblock categories (ignore config)
+            cmd.args(["--sponsorblock-remove", "all"]);
+        }
+        MediaType::Video => {
+            // For video, use config settings
+            if let Some(mark) = &config.sponsorblock_mark
+                && !mark.is_empty()
+            {
+                cmd.args(["--sponsorblock-mark", mark]);
+            }
+            if let Some(remove) = &config.sponsorblock_remove
+                && !remove.is_empty()
+            {
+                cmd.args(["--sponsorblock-remove", remove]);
+            }
+        }
     }
 
     // Add cookies if available
@@ -100,7 +134,7 @@ pub async fn spawn_download_media_task(
     }
 
     // Set output filename
-    cmd.args(["-o", &format!("{}.mp4", title)]);
+    cmd.args(["-o", &format!("{}.{}", title, file_ext)]);
     cmd.arg(&url);
 
     // Spawn the download process
@@ -132,11 +166,13 @@ pub async fn spawn_download_media_task(
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let path = entry.path();
                 if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                    // Check if it's a video file starting with our title
+                    // Check if it's a media file starting with our title
+                    let file_extensions = match media_type {
+                        MediaType::Audio => vec![".ogg"],
+                        MediaType::Video => vec![".mp4", ".mkv", ".webm"],
+                    };
                     if file_name.starts_with(title)
-                        && (file_name.ends_with(".mp4")
-                            || file_name.ends_with(".mkv")
-                            || file_name.ends_with(".webm"))
+                        && file_extensions.iter().any(|ext| file_name.ends_with(ext))
                     {
                         found_file = Some(path);
                         break;
@@ -204,4 +240,3 @@ fn sanitize_title(title: &str) -> String {
         .take(100) // Limit to 100 characters
         .collect()
 }
-

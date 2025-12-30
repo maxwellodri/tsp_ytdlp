@@ -1,7 +1,7 @@
 use crate::{
+    Config,
     common::{format_bytes, send_critical_notification, send_notification},
     task::fs::{find_cache_dir_by_hash, get_disk_space, get_video_dir_for_url},
-    Config,
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -28,6 +28,15 @@ impl std::fmt::Display for MediaType {
             MediaType::Audio => "Audio",
         };
         write!(f, "{}", string)
+    }
+}
+
+impl MediaType {
+    pub fn emoji(&self) -> &'static str {
+        match self {
+            MediaType::Video => "🎬",
+            MediaType::Audio => "🎵",
+        }
     }
 }
 
@@ -238,11 +247,16 @@ impl Task {
                 send_notification(url, &format!("Processing: {} 🔄", url), Some(5000), config)
                     .await;
 
-                // Determine output template based on URL
-                let output_template = if url.contains("youtube.com") || url.contains("youtu.be") {
-                    "%(channel)s_%(title)s"
-                } else {
-                    "%(title)s"
+                // Determine output template based on URL and media_type
+                let output_template = match media_type {
+                    MediaType::Audio => "%(track)_%(artist)s",
+                    MediaType::Video => {
+                        if url.contains("youtube.com") || url.contains("youtu.be") {
+                            "%(channel)s_%(title)s"
+                        } else {
+                            "%(title)s"
+                        }
+                    }
                 };
 
                 // Spawn yt-dlp to get metadata
@@ -442,18 +456,24 @@ impl Task {
                     .is_some();
 
                 // Send notification with title (different message for restart vs fresh download)
-                let title_display = title.as_deref().unwrap_or("video");
+                let title_display = title.as_deref().unwrap_or("download");
                 let notification_message = if is_restart {
                     format!("Resuming download: {} 🔄", title_display)
                 } else {
-                    format!("Downloading: {} 🎬", title_display)
+                    format!("Downloading: {} {}", title_display, media_type.emoji())
                 };
                 send_notification(url, &notification_message, Some(3000), config).await;
 
                 *self = Task::DownloadVideo {
                     url: url_clone.clone(),
-                    path: PathBuf::from(&directory)
-                        .join(format!("{}.mp4", title.as_deref().unwrap_or("download"))),
+                    path: PathBuf::from(&directory).join(format!(
+                        "{}.{}",
+                        title.as_deref().unwrap_or("download"),
+                        match media_type {
+                            MediaType::Audio => "ogg",
+                            MediaType::Video => "mp4",
+                        }
+                    )),
                     media_type: *media_type,
                     metadata: DownloadMetadata {
                         title: title.clone(),
