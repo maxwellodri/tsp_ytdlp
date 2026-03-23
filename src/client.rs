@@ -1,5 +1,7 @@
 use crate::{
-    common::{format_bytes, send_notification, APP}, task::MediaType, ClientRequest, Config, ServerResponse
+    ClientRequest, Config, ServerResponse,
+    common::{APP, format_bytes, send_notification},
+    task::MediaType,
 };
 use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -42,17 +44,28 @@ async fn send_request(request: ClientRequest, config: &Config) -> Result<ServerR
 }
 
 /// Add a task to the daemon
-pub async fn run_client_add(url: String, media_type: MediaType, start_paused: bool, config: &Config) -> Result<()> {
+pub async fn run_client_add(
+    url: String,
+    media_type: MediaType,
+    start_paused: bool,
+    download_dir: Option<String>,
+    config: &Config,
+) -> Result<()> {
     // Check if daemon is active
     if !crate::is_daemon_active(config).await {
         // Daemon is not running, queue the task for next startup
-        crate::append_to_queued_tasks(url.clone(), media_type, config).await?;
+        crate::append_to_queued_tasks(url.clone(), media_type, download_dir, config).await?;
         println!("Daemon not running, queued for next startup: {}", url);
         return Ok(());
     }
 
     // Daemon is running, send add request
-    let request = ClientRequest::Add { url, media_type, start_paused };
+    let request = ClientRequest::Add {
+        url,
+        media_type,
+        start_paused,
+        download_dir,
+    };
     let response = send_request(request, config).await?;
 
     match response {
@@ -107,7 +120,11 @@ pub async fn run_client_status(verbose: bool, config: &Config, filter_failed: bo
                 if !queued_tasks.is_empty() {
                     println!("Queued ({}):", queued_tasks.len());
                     for task in &queued_tasks {
-                        println!("  #{}: {}", task.id, task.url);
+                        if let Some(ref dir) = task.download_dir {
+                            println!("  #{}: {} (to {})", task.id, task.url, dir);
+                        } else {
+                            println!("  #{}: {}", task.id, task.url);
+                        }
                     }
                     println!();
                 }
@@ -159,6 +176,16 @@ pub async fn run_client_status(verbose: bool, config: &Config, filter_failed: bo
                         if verbose && let Some(ref path) = task.path {
                             println!("      Path: {}", path);
                         }
+
+                        // Show download_dir if set
+                        if let Some(ref dir) = task.download_dir {
+                            println!("      Dir: {}", dir);
+                        }
+
+                        // Show last log line (8-space indentation)
+                        if let Some(ref log_line) = task.last_log_line {
+                            println!("        {}", log_line);
+                        }
                     }
                     println!();
                 }
@@ -178,6 +205,10 @@ pub async fn run_client_status(verbose: bool, config: &Config, filter_failed: bo
                         if let Some(ref path) = task.path {
                             println!("      Path: {}", path);
                         }
+
+                        if let Some(ref dir) = task.download_dir {
+                            println!("      Dir: {}", dir);
+                        }
                     }
                     println!();
                 }
@@ -189,6 +220,9 @@ pub async fn run_client_status(verbose: bool, config: &Config, filter_failed: bo
                         println!("  #{}: {}", task.id, task.url);
                         if let Some(ref error) = task.error {
                             println!("      Error: {}", error);
+                        }
+                        if let Some(ref dir) = task.download_dir {
+                            println!("      Dir: {}", dir);
                         }
                     }
                     println!();
@@ -217,27 +251,22 @@ pub async fn run_client_status(verbose: bool, config: &Config, filter_failed: bo
                             print!("{}", task.url);
                         }
 
-                        // Show progress if available
-                        if let Some(progress) = task.progress_percent {
-                            // Show percentage and current size
-                            if let Some(current_bytes) = task.current_size_bytes {
-                                print!(" ({:.1}%, {})", progress, format_bytes(current_bytes));
-                            } else {
-                                print!(" ({:.1}%)", progress);
-                            }
-                        } else if let Some(current_bytes) = task.current_size_bytes {
-                            // No total size, just show current size
-                            print!(" ({})", format_bytes(current_bytes));
-                        } else {
-                            print!(" ({})", task.task_type);
-                        }
-
                         // Show (Paused) suffix if paused
                         if task.is_paused {
                             print!(" (Paused)");
                         }
 
+                        // Show (to <dir>) suffix if custom download_dir
+                        if let Some(ref dir) = task.download_dir {
+                            print!(" (to {})", dir);
+                        }
+
                         println!();
+
+                        // Show last log line (8-space indentation)
+                        if let Some(ref log_line) = task.last_log_line {
+                            println!("        {}", log_line);
+                        }
                     }
                 }
 
@@ -245,7 +274,11 @@ pub async fn run_client_status(verbose: bool, config: &Config, filter_failed: bo
                 if !queued_tasks.is_empty() {
                     println!("Queued ({}):", queued_tasks.len());
                     for task in &queued_tasks {
-                        println!("  #{}: {}", task.id, task.url);
+                        if let Some(ref dir) = task.download_dir {
+                            println!("  #{}: {} (to {})", task.id, task.url, dir);
+                        } else {
+                            println!("  #{}: {}", task.id, task.url);
+                        }
                     }
                 }
 
@@ -259,7 +292,14 @@ pub async fn run_client_status(verbose: bool, config: &Config, filter_failed: bo
                         if let Some(ref title) = task.title {
                             print!("{} ", title);
                         }
-                        println!("{}", task.url);
+                        print!("{}", task.url);
+
+                        // Show (to <dir>) suffix if custom download_dir
+                        if let Some(ref dir) = task.download_dir {
+                            print!(" (to {})", dir);
+                        }
+
+                        println!();
                     }
                 }
 
@@ -313,7 +353,15 @@ pub async fn run_client_failed(config: &Config) -> Result<()> {
                 }
             } else {
                 // Pretty print as table
-                println!("\n=== Failed Tasks ({}) ===\n", failed_tasks.len());
+                let session_failed = failed_tasks
+                    .iter()
+                    .filter(|t| t.error.as_deref() != Some("Recovered from previous session"))
+                    .count();
+                println!(
+                    "\n=== Failed Tasks ({}, {} this session) ===\n",
+                    failed_tasks.len(),
+                    session_failed
+                );
                 println!("{:<6} | URL", "ID");
                 println!("{:-<6}-+-{:-<60}", "", "");
                 for task in &failed_tasks {
@@ -422,10 +470,15 @@ pub async fn run_client_info(id: u64, config: &Config) -> Result<()> {
     let response = send_request(request, config).await?;
 
     match response {
-        ServerResponse::Info { log_file_path } => {
+        ServerResponse::Info {
+            log_file_path,
+            download_dir,
+        } => {
             println!("Log file: {}", log_file_path);
+            if let Some(dir) = download_dir {
+                println!("Download dir: {}", dir);
+            }
 
-            // Try to display the log file if it exists
             if std::path::Path::new(&log_file_path).exists() {
                 println!("\n--- Log contents ---");
                 match std::fs::read_to_string(&log_file_path) {

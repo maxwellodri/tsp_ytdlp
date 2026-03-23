@@ -155,14 +155,31 @@ cookies_file = "$HOME/cookies.txt"
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ClientRequest {
-    Add { url: String, start_paused: bool, media_type: MediaType },
-    Remove { id: u64 },
+    Add {
+        url: String,
+        start_paused: bool,
+        media_type: MediaType,
+        download_dir: Option<String>,
+    },
+    Remove {
+        id: u64,
+    },
     Clear,
-    Status { verbose: bool },
-    Kill { sender_pid: u32 },
-    Info { id: u64 },
-    Pause { ids: Option<Vec<u64>> },
-    Resume { ids: Option<Vec<u64>> },
+    Status {
+        verbose: bool,
+    },
+    Kill {
+        sender_pid: u32,
+    },
+    Info {
+        id: u64,
+    },
+    Pause {
+        ids: Option<Vec<u64>>,
+    },
+    Resume {
+        ids: Option<Vec<u64>>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -183,6 +200,7 @@ pub enum ServerResponse {
     },
     Info {
         log_file_path: String,
+        download_dir: Option<String>,
     },
 }
 
@@ -200,6 +218,8 @@ pub struct TaskSummary {
     pub paused_reason: Option<String>,
     pub progress_percent: Option<f32>,
     pub current_size_bytes: Option<u64>,
+    pub last_log_line: Option<String>,
+    pub download_dir: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -268,7 +288,7 @@ impl Default for Config {
 
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct QueuedTasks {
-    pub urls: Vec<(String, MediaType)>,
+    pub urls: Vec<(String, MediaType, Option<String>)>,
 }
 
 #[derive(Debug)]
@@ -290,11 +310,6 @@ pub struct TaskManager {
 pub struct Args {
     #[command(subcommand)]
     pub command: Option<Command>,
-
-    #[arg(help = "URL to download")]
-    pub url: Option<String>,
-    #[arg(long, help  = "Download audio only for this url")]
-    pub audio: bool,
 
     #[arg(short, long, help = "Show verbose status information")]
     pub verbose: bool,
@@ -336,8 +351,11 @@ pub struct Args {
     )]
     pub resume: Option<Option<String>>,
 
-    #[arg(long, help = "Add URL as paused (use with URL argument)")]
-    pub paused: bool,
+    #[arg(
+        long,
+        help = "Show queued URLs from offline queue (only when daemon is not running)"
+    )]
+    pub queued: bool,
 }
 
 #[derive(Subcommand)]
@@ -348,6 +366,17 @@ pub enum Command {
         tmux: bool,
         #[arg(long, help = "Kill existing daemon before starting")]
         kill: bool,
+    },
+    #[command(about = "Add a URL to download")]
+    Add {
+        #[arg(help = "URL to download")]
+        url: String,
+        #[arg(long, help = "Download audio only")]
+        audio: bool,
+        #[arg(long, help = "Add URL as paused")]
+        paused: bool,
+        #[arg(long, help = "Download directory (must exist)")]
+        dir: Option<String>,
     },
 }
 
@@ -397,6 +426,20 @@ pub fn get_data_dir() -> PathBuf {
     let data_dir = project_dirs.data_dir();
     std::fs::create_dir_all(data_dir).expect("Could not create data directory");
     data_dir.to_path_buf()
+}
+
+fn get_task_last_log_line(task_id: u64) -> Option<String> {
+    let log_dir = get_data_dir();
+    let log_path = log_dir.join(format!("task_{}.log", task_id));
+
+    match std::fs::read_to_string(&log_path) {
+        Ok(contents) => contents
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .last()
+            .map(|s| s.to_string()),
+        Err(_) => None,
+    }
 }
 
 pub fn get_config_path() -> PathBuf {
@@ -501,8 +544,13 @@ impl TaskManager {
         })
     }
 
-    pub fn add_task(&mut self, url: String, media_type: MediaType) -> Result<u64, String> {
-        self.tasks.add_url_as_task(url, media_type)
+    pub fn add_task(
+        &mut self,
+        url: String,
+        media_type: MediaType,
+        download_dir: Option<String>,
+    ) -> Result<u64, String> {
+        self.tasks.add_url_as_task(url, media_type, download_dir)
     }
 
     pub fn remove_task(&mut self, id: u64) -> bool {
@@ -560,12 +608,19 @@ impl TaskManager {
                 path: self.get_task_path(task),
                 task_type: self.get_task_type(task),
                 error: self.get_task_error(task),
-                timestamp: None,       // Could be enhanced later
-                elapsed_seconds: None, // Could be enhanced later
+                timestamp: None,
+                elapsed_seconds: None,
                 is_paused: task.is_paused(),
                 paused_reason: None,
                 progress_percent: self.get_task_progress(task),
                 current_size_bytes: self.get_task_current_size(task),
+                last_log_line: match task {
+                    Task::DownloadVideo { .. } | Task::PausedDownloadVideo { .. } => {
+                        get_task_last_log_line(*id)
+                    }
+                    _ => None,
+                },
+                download_dir: task.download_dir().cloned(),
             };
 
             match task {
@@ -853,12 +908,17 @@ pub fn load_queued_tasks() -> Result<QueuedTasks> {
 }
 
 /// Append a URL to the queued tasks file
-pub async fn append_to_queued_tasks(url: String, media_type: MediaType, config: &Config) -> Result<()> {
+pub async fn append_to_queued_tasks(
+    url: String,
+    media_type: MediaType,
+    download_dir: Option<String>,
+    config: &Config,
+) -> Result<()> {
     let data_dir = get_data_dir();
     let queued_path = data_dir.join("queued_tasks.json");
 
     let mut queued = load_queued_tasks().unwrap_or_default();
-    queued.urls.push((url.clone(), media_type));
+    queued.urls.push((url.clone(), media_type, download_dir));
     let content = serde_json::to_string_pretty(&queued)?;
     std::fs::write(&queued_path, content)?;
     send_notification(
@@ -1066,6 +1126,19 @@ async fn main() -> anyhow::Result<()> {
     let config = load_config_from_path(args.config.as_deref());
 
     match args.command {
+        Some(Command::Add {
+            url,
+            audio,
+            paused,
+            dir,
+        }) => {
+            let media_type = if audio {
+                MediaType::Audio
+            } else {
+                MediaType::Video
+            };
+            client::run_client_add(url, media_type, paused, dir, &config).await?;
+        }
         Some(Command::Daemon { tmux, kill }) => {
             // Handle --kill flag first (before --tmux processing)
             if kill {
@@ -1155,6 +1228,27 @@ async fn main() -> anyhow::Result<()> {
         }
         None => {
             // Client mode
+            if args.queued {
+                if !is_daemon_active(&config).await {
+                    match load_queued_tasks() {
+                        Ok(queued) => {
+                            if queued.urls.is_empty() {
+                                println!("No queued URLs");
+                            } else {
+                                println!("Queued URLs ({}):", queued.urls.len());
+                                for (url, _, _) in &queued.urls {
+                                    println!("  {}", url);
+                                }
+                            }
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            eprintln!("Error reading queued tasks: {}", e);
+                            return Ok(());
+                        }
+                    }
+                }
+            }
             if args.kill {
                 client::run_client_kill(&config).await?;
             } else if let Some(ref remove_str) = args.remove {
@@ -1184,9 +1278,6 @@ async fn main() -> anyhow::Result<()> {
                     None => None, // Resume all paused
                 };
                 client::run_client_resume(ids, &config).await?;
-            } else if let Some(url) = args.url {
-                let media_type = if args.audio { MediaType::Audio } else { MediaType::Video };
-                client::run_client_add(url, media_type, args.paused, &config).await?;
             } else {
                 // Default: show status
                 if args.failed {

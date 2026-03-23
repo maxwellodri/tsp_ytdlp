@@ -7,7 +7,10 @@ use tracing::info;
 pub struct SerializableTask {
     pub url: String,
     pub task_kind: TaskKind,
+    #[serde(default)]
     pub media_type: MediaType,
+    #[serde(default)]
+    pub download_dir: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -74,6 +77,7 @@ impl From<SerializableTasks> for Tasks {
                         url: task.url.clone(),
                         human_readable_error: "Recovered from previous session".to_string(),
                         media_type: task.media_type,
+                        download_dir: task.download_dir.clone(),
                     },
                 );
                 info!("Recovered failed task {} for URL: {}", idx, task.url);
@@ -95,6 +99,7 @@ impl From<SerializableTasks> for Tasks {
                             url: task.url.clone(),
                             should_auto_resume: true,
                             media_type: task.media_type,
+                            download_dir: task.download_dir.clone(),
                         },
                     );
                     info!("Recovered paused queued task {} for URL: {}", idx, task.url);
@@ -116,6 +121,7 @@ impl From<SerializableTasks> for Tasks {
                             metadata: None,
                             should_auto_resume: true,
                             media_type: task.media_type,
+                            download_dir: task.download_dir.clone(),
                         },
                     );
                     info!(
@@ -138,7 +144,8 @@ impl From<SerializableTasks> for Tasks {
                         Task::PausedQueued {
                             url: task.url.clone(),
                             should_auto_resume: true,
-                            media_type: task.media_type
+                            media_type: task.media_type,
+                            download_dir: task.download_dir.clone(),
                         },
                     );
                     info!("Recovered paused DownloadVideo task {} as PausedQueued for URL: {} (will re-fetch metadata)", idx, task.url);
@@ -154,7 +161,14 @@ impl From<SerializableTasks> for Tasks {
                 if !tasks.task_list.values().any(|t| t.url() == task.url) {
                     let idx = tasks.index_counter;
                     tasks.index_counter += 1;
-                    tasks.task_list.insert(idx, Task::Queued { url: task.url.clone(), media_type: task.media_type });
+                    tasks.task_list.insert(
+                        idx,
+                        Task::Queued {
+                            url: task.url.clone(),
+                            media_type: task.media_type,
+                            download_dir: task.download_dir.clone(),
+                        },
+                    );
                     info!("Recovered DownloadVideo task {} as Queued for URL: {} (yt-dlp will resume from fragments)", idx, task.url);
                 }
             });
@@ -173,6 +187,7 @@ impl From<SerializableTasks> for Tasks {
                         Task::Queued {
                             url: task.url.clone(),
                             media_type: task.media_type,
+                            download_dir: task.download_dir.clone(),
                         },
                     );
                     info!(
@@ -196,6 +211,7 @@ impl From<SerializableTasks> for Tasks {
                         Task::Queued {
                             url: task.url.clone(),
                             media_type: task.media_type,
+                            download_dir: task.download_dir.clone(),
                         },
                     );
                     info!("Recovered queued task {} for URL: {}", idx, task.url);
@@ -228,6 +244,7 @@ impl From<Task> for SerializableTask {
             url: task.url().to_string(),
             task_kind,
             media_type: task.media_type(),
+            download_dir: task.download_dir().cloned(),
         }
     }
 }

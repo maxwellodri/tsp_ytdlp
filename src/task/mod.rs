@@ -69,28 +69,33 @@ pub enum Task {
     Queued {
         url: String,
         media_type: MediaType,
+        download_dir: Option<String>,
     },
     GetName {
         url: String,
         metadata: Option<GetNameMetadata>,
         media_type: MediaType,
+        download_dir: Option<String>,
     },
     DownloadVideo {
         url: String,
         path: PathBuf,
         media_type: MediaType,
         metadata: DownloadMetadata,
+        download_dir: Option<String>,
     },
     PausedQueued {
         url: String,
         media_type: MediaType,
         should_auto_resume: bool,
+        download_dir: Option<String>,
     },
     PausedGetName {
         url: String,
         metadata: Option<GetNameMetadata>,
         should_auto_resume: bool,
         media_type: MediaType,
+        download_dir: Option<String>,
     },
     PausedDownloadVideo {
         media_type: MediaType,
@@ -98,16 +103,19 @@ pub enum Task {
         path: PathBuf,
         metadata: DownloadMetadata,
         should_auto_resume: bool,
+        download_dir: Option<String>,
     },
     Completed {
         url: String,
         media_type: MediaType,
         path: PathBuf,
+        download_dir: Option<String>,
     },
     Failed {
         media_type: MediaType,
         url: String,
         human_readable_error: String,
+        download_dir: Option<String>,
     },
 }
 
@@ -155,36 +163,43 @@ impl Task {
         )
     }
 
-    /// Pause this task. Sets should_auto_resume to false (manual pause).
-    /// No-op if already paused, completed, or failed.
     pub fn pause(&mut self) {
         let paused = match self {
-            Task::Queued { url, media_type } => Task::PausedQueued {
+            Task::Queued {
+                url,
+                media_type,
+                download_dir,
+            } => Task::PausedQueued {
                 url: url.clone(),
                 media_type: *media_type,
                 should_auto_resume: false,
+                download_dir: download_dir.clone(),
             },
             Task::GetName {
                 url,
                 metadata,
                 media_type,
+                download_dir,
             } => Task::PausedGetName {
                 url: url.clone(),
                 metadata: metadata.clone(),
                 should_auto_resume: false,
                 media_type: *media_type,
+                download_dir: download_dir.clone(),
             },
             Task::DownloadVideo {
                 url,
                 path,
                 metadata,
                 media_type,
+                download_dir,
             } => Task::PausedDownloadVideo {
                 url: url.clone(),
                 path: path.clone(),
                 metadata: metadata.clone(),
                 should_auto_resume: false,
                 media_type: *media_type,
+                download_dir: download_dir.clone(),
             },
             // Already paused, completed, or failed - no-op
             _ => return,
@@ -192,36 +207,43 @@ impl Task {
         *self = paused;
     }
 
-    /// Unpause this task. No-op if not paused.
     pub fn unpause(&mut self) {
         let unpaused = match self {
             Task::PausedQueued {
-                url, media_type, ..
+                url,
+                media_type,
+                download_dir,
+                ..
             } => Task::Queued {
                 url: url.clone(),
                 media_type: *media_type,
+                download_dir: download_dir.clone(),
             },
             Task::PausedGetName {
                 url,
                 metadata,
                 media_type,
+                download_dir,
                 ..
             } => Task::GetName {
                 url: url.clone(),
                 metadata: metadata.clone(),
                 media_type: *media_type,
+                download_dir: download_dir.clone(),
             },
             Task::PausedDownloadVideo {
                 url,
                 path,
                 metadata,
                 media_type,
+                download_dir,
                 ..
             } => Task::DownloadVideo {
                 url: url.clone(),
                 path: path.clone(),
                 metadata: metadata.clone(),
                 media_type: *media_type,
+                download_dir: download_dir.clone(),
             },
             // Not paused - no-op
             _ => return,
@@ -238,14 +260,30 @@ impl Task {
 
         match (&self, next) {
             // Queued → GetName: Fetch metadata using yt-dlp --simulate
-            (Task::Queued { url, media_type }, TaskKind::GetName) => {
+            (
+                Task::Queued {
+                    url,
+                    media_type,
+                    download_dir,
+                },
+                TaskKind::GetName,
+            ) => {
                 info!("Transitioning task to GetName for URL: {}", url);
 
                 let url_clone = url.clone();
+                let download_dir_clone = download_dir.clone();
 
-                // Send notification with MD5-based notification ID (5s timeout)
-                send_notification(url, &format!("Processing: {} 🔄", url), Some(5000), config)
-                    .await;
+                let dir_suffix = download_dir_clone
+                    .as_ref()
+                    .map(|d| format!(" to {}", d))
+                    .unwrap_or_default();
+                send_notification(
+                    url,
+                    &format!("Processing: {}{} 🔄", url, dir_suffix),
+                    Some(5000),
+                    config,
+                )
+                .await;
 
                 // Determine output template based on URL and media_type
                 let output_template = match media_type {
@@ -295,8 +333,11 @@ impl Task {
                             let filesize_str = lines[1].trim();
                             let expected_size_bytes = filesize_str.parse::<u64>().ok();
 
-                            // Get directory for this URL
-                            let directory = get_video_dir_for_url(url, config, *media_type).await;
+                            // Get directory for this URL - use stored download_dir or fall back to script/default
+                            let directory = match &download_dir_clone {
+                                Some(dir) => dir.clone(),
+                                None => get_video_dir_for_url(url, config, *media_type).await,
+                            };
 
                             // Format the log output nicely
                             let size_display = match expected_size_bytes {
@@ -317,13 +358,18 @@ impl Task {
                                     expected_size_bytes,
                                     directory,
                                 }),
+                                download_dir: download_dir_clone,
                             };
                         } else {
                             error!("GetName failed: unexpected output format");
                             let error_msg = "Failed to parse yt-dlp metadata output".to_string();
+                            let dir_suffix = download_dir_clone
+                                .as_ref()
+                                .map(|d| format!(" to {}", d))
+                                .unwrap_or_default();
                             send_critical_notification(
                                 url,
-                                &format!("❌ Download failed: {}", error_msg),
+                                &format!("❌ Download failed:{} {}", dir_suffix, error_msg),
                                 config,
                             )
                             .await;
@@ -331,6 +377,7 @@ impl Task {
                                 url: url_clone,
                                 human_readable_error: error_msg,
                                 media_type: *media_type,
+                                download_dir: download_dir_clone,
                             };
                         }
                     }
@@ -341,9 +388,13 @@ impl Task {
                             "yt-dlp metadata fetch failed: {}",
                             stderr.lines().next().unwrap_or("unknown error")
                         );
+                        let dir_suffix = download_dir_clone
+                            .as_ref()
+                            .map(|d| format!(" to {}", d))
+                            .unwrap_or_default();
                         send_critical_notification(
                             url,
-                            &format!("❌ Download failed: {}", error_msg),
+                            &format!("❌ Download failed:{} {}", dir_suffix, error_msg),
                             config,
                         )
                         .await;
@@ -351,14 +402,19 @@ impl Task {
                             url: url_clone,
                             human_readable_error: error_msg,
                             media_type: *media_type,
+                            download_dir: download_dir_clone,
                         };
                     }
                     Err(e) => {
                         error!("GetName spawn failed: {}", e);
                         let error_msg = format!("Failed to spawn yt-dlp: {}", e);
+                        let dir_suffix = download_dir_clone
+                            .as_ref()
+                            .map(|d| format!(" to {}", d))
+                            .unwrap_or_default();
                         send_critical_notification(
                             url,
-                            &format!("❌ Download failed: {}", error_msg),
+                            &format!("❌ Download failed:{} {}", dir_suffix, error_msg),
                             config,
                         )
                         .await;
@@ -366,6 +422,7 @@ impl Task {
                             url: url_clone,
                             human_readable_error: error_msg,
                             media_type: *media_type,
+                            download_dir: download_dir_clone,
                         };
                     }
                 }
@@ -377,13 +434,15 @@ impl Task {
                     url,
                     metadata,
                     media_type,
+                    download_dir,
                 },
                 TaskKind::DownloadVideo,
             ) => {
                 info!("Transitioning task to DownloadVideo for URL: {}", url);
 
                 let url_clone = url.clone();
-                let metadata = match metadata {
+                let download_dir_clone = download_dir.clone();
+                let mut metadata = match metadata {
                     Some(m) => m.clone(),
                     None => {
                         error!("GetName metadata is None, cannot transition to DownloadVideo");
@@ -391,10 +450,16 @@ impl Task {
                             url: url_clone,
                             human_readable_error: "Missing metadata from GetName phase".to_string(),
                             media_type: *media_type,
+                            download_dir: download_dir_clone,
                         };
                         return;
                     }
                 };
+
+                if metadata.directory.is_empty() {
+                    metadata.directory = get_video_dir_for_url(url, config, *media_type).await;
+                    info!("Recovered empty directory, set to: {}", metadata.directory);
+                }
 
                 // Check disk space using df command
                 let available_mb = match get_disk_space(&metadata.directory).await {
@@ -402,9 +467,13 @@ impl Task {
                     Err(e) => {
                         let error_msg = format!("Failed to check disk space: {}", e);
                         error!("{}", error_msg);
+                        let dir_suffix = download_dir_clone
+                            .as_ref()
+                            .map(|d| format!(" to {}", d))
+                            .unwrap_or_default();
                         send_critical_notification(
                             url,
-                            &format!("❌ Download failed: {}", error_msg),
+                            &format!("❌ Download failed:{} {}", dir_suffix, error_msg),
                             config,
                         )
                         .await;
@@ -412,6 +481,7 @@ impl Task {
                             url: url_clone,
                             human_readable_error: error_msg,
                             media_type: *media_type,
+                            download_dir: download_dir_clone,
                         };
                         return;
                     }
@@ -424,9 +494,13 @@ impl Task {
                         available_mb, config.disk_threshold
                     );
                     error!("{}", error_msg);
+                    let dir_suffix = download_dir_clone
+                        .as_ref()
+                        .map(|d| format!(" to {}", d))
+                        .unwrap_or_default();
                     send_critical_notification(
                         url,
-                        &format!("❌ Download failed: {}", error_msg),
+                        &format!("❌ Download failed:{} {}", dir_suffix, error_msg),
                         config,
                     )
                     .await;
@@ -434,6 +508,7 @@ impl Task {
                         url: url_clone,
                         human_readable_error: error_msg,
                         media_type: *media_type,
+                        download_dir: download_dir_clone,
                     };
                     return;
                 }
@@ -457,10 +532,19 @@ impl Task {
 
                 // Send notification with title (different message for restart vs fresh download)
                 let title_display = title.as_deref().unwrap_or("download");
+                let dir_suffix = download_dir_clone
+                    .as_ref()
+                    .map(|d| format!(" to {}", d))
+                    .unwrap_or_default();
                 let notification_message = if is_restart {
-                    format!("Resuming download: {} 🔄", title_display)
+                    format!("Resuming download: {}{} 🔄", title_display, dir_suffix)
                 } else {
-                    format!("Downloading: {} {}", title_display, media_type.emoji())
+                    format!(
+                        "Downloading: {}{} {}",
+                        title_display,
+                        dir_suffix,
+                        media_type.emoji()
+                    )
                 };
                 send_notification(url, &notification_message, Some(3000), config).await;
 
@@ -483,6 +567,7 @@ impl Task {
                         process_id: None,
                         log_file: None,
                     },
+                    download_dir: download_dir_clone,
                 };
 
                 // Note: Actual download will be spawned and polled by daemon
@@ -495,6 +580,7 @@ impl Task {
                     url,
                     path,
                     media_type,
+                    download_dir,
                     ..
                 },
                 TaskKind::Completed,
@@ -504,6 +590,7 @@ impl Task {
                     url: url.clone(),
                     path: path.clone(),
                     media_type: *media_type,
+                    download_dir: download_dir.clone(),
                 };
             }
 
@@ -511,11 +598,16 @@ impl Task {
             (task, TaskKind::Failed) => {
                 let url = task.url().to_string();
                 let media_type = task.media_type();
+                let download_dir = task.download_dir().cloned();
                 let error_msg = context.unwrap_or_else(|| "Unknown error".to_string());
                 error!("Task failed for URL {}: {}", url, error_msg);
+                let dir_suffix = download_dir
+                    .as_ref()
+                    .map(|d| format!(" to {}", d))
+                    .unwrap_or_default();
                 send_critical_notification(
                     &url,
-                    &format!("❌ Download failed: {}", error_msg),
+                    &format!("❌ Download failed:{} {}", dir_suffix, error_msg),
                     config,
                 )
                 .await;
@@ -523,6 +615,7 @@ impl Task {
                     url,
                     human_readable_error: error_msg,
                     media_type,
+                    download_dir,
                 };
             }
 
@@ -546,6 +639,19 @@ impl Task {
             Task::PausedDownloadVideo { media_type, .. } => *media_type,
             Task::Completed { media_type, .. } => *media_type,
             Task::Failed { media_type, .. } => *media_type,
+        }
+    }
+
+    pub fn download_dir(&self) -> Option<&String> {
+        match self {
+            Task::Queued { download_dir, .. } => download_dir.as_ref(),
+            Task::GetName { download_dir, .. } => download_dir.as_ref(),
+            Task::DownloadVideo { download_dir, .. } => download_dir.as_ref(),
+            Task::PausedQueued { download_dir, .. } => download_dir.as_ref(),
+            Task::PausedGetName { download_dir, .. } => download_dir.as_ref(),
+            Task::PausedDownloadVideo { download_dir, .. } => download_dir.as_ref(),
+            Task::Completed { download_dir, .. } => download_dir.as_ref(),
+            Task::Failed { download_dir, .. } => download_dir.as_ref(),
         }
     }
 }
@@ -631,7 +737,23 @@ impl Tasks {
         self.active_tasks.drain()
     }
 
-    pub fn add_url_as_task(&mut self, url: String, media_type: MediaType) -> Result<u64, String> {
+    pub fn add_url_as_task(
+        &mut self,
+        url: String,
+        media_type: MediaType,
+        download_dir: Option<String>,
+    ) -> Result<u64, String> {
+        // Validate download_dir exists if provided
+        if let Some(ref dir) = download_dir {
+            let path = std::path::Path::new(dir);
+            if !path.exists() {
+                return Err(format!("Download directory does not exist: {}", dir));
+            }
+            if !path.is_dir() {
+                return Err(format!("Download path is not a directory: {}", dir));
+            }
+        }
+
         for (existing_id, task) in self.task_list.iter() {
             if task.url() == url {
                 return Err(format!("URL already exists with task ID {}", existing_id));
@@ -642,7 +764,11 @@ impl Tasks {
         let task_id = self.index_counter;
         self.index_counter += 1;
 
-        let task = Task::Queued { url, media_type };
+        let task = Task::Queued {
+            url,
+            media_type,
+            download_dir,
+        };
         self.task_list.insert(task_id, task);
 
         // Initialize status channel

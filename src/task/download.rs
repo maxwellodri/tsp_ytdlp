@@ -2,6 +2,7 @@ use crate::Config;
 use crate::task::GetNameMetadata;
 use crate::task::MediaType;
 use anyhow::{Context, Result};
+use std::fs::File;
 use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::process::Command;
@@ -14,6 +15,8 @@ pub async fn spawn_download_media_task(
     media_type: MediaType,
     metadata: GetNameMetadata,
     config: Config,
+    task_id: u64,
+    log_file_path: std::path::PathBuf,
 ) -> Result<PathBuf> {
     let title = metadata.title.as_deref().unwrap_or("download");
 
@@ -76,7 +79,7 @@ pub async fn spawn_download_media_task(
                 "--merge-output-format",
                 "mp4",
                 "--format",
-                "best[height<=?720]",
+                "bestvideo[height<=?720]+bestaudio/best[height<=?720]",
             ]);
         }
     }
@@ -137,17 +140,34 @@ pub async fn spawn_download_media_task(
     cmd.args(["-o", &format!("{}.{}", title, file_ext)]);
     cmd.arg(&url);
 
-    // Spawn the download process
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    // Create log file and redirect both stdout and stderr to it
+    tokio::fs::create_dir_all(log_file_path.parent().unwrap())
+        .await
+        .context("Failed to create log directory")?;
 
-    let output = cmd.output().await.context("Failed to spawn yt-dlp")?;
+    let log_file = File::create(&log_file_path).context("Failed to create log file")?;
+    info!(
+        "Task {} yt-dlp output will be logged to: {}",
+        task_id,
+        log_file_path.display()
+    );
+
+    // Spawn the download process with streams redirected to log file
+    cmd.stdout(Stdio::from(log_file.try_clone()?));
+    cmd.stderr(Stdio::from(log_file));
+
+    let mut child = cmd.spawn().context("Failed to spawn yt-dlp")?;
+
+    // Wait for process to complete (avoid buffer deadlock by not capturing output)
+    let status = child.wait().await.context("Failed to wait for yt-dlp")?;
 
     // Check exit status
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let error_msg = stderr.lines().next().unwrap_or("unknown error");
-        return Err(anyhow::anyhow!("yt-dlp failed: {}", error_msg));
+    if !status.success() {
+        return Err(anyhow::anyhow!(
+            "yt-dlp failed with exit code: {}. See log file: {}",
+            status.code().unwrap_or(-1),
+            log_file_path.display()
+        ));
     }
 
     info!(
