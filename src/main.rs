@@ -369,14 +369,16 @@ pub enum Command {
     },
     #[command(about = "Add a URL to download")]
     Add {
-        #[arg(help = "URL to download")]
-        url: String,
+        #[arg(help = "URL to download", conflicts_with = "id")]
+        url: Option<String>,
         #[arg(long, help = "Download audio only")]
         audio: bool,
         #[arg(long, help = "Add URL as paused")]
         paused: bool,
         #[arg(long, help = "Download directory (must exist)")]
         dir: Option<String>,
+        #[arg(long, help = "Restart failed task by ID")]
+        id: Option<u64>,
     },
 }
 
@@ -1131,13 +1133,25 @@ async fn main() -> anyhow::Result<()> {
             audio,
             paused,
             dir,
+            id,
         }) => {
             let media_type = if audio {
                 MediaType::Audio
             } else {
                 MediaType::Video
             };
-            client::run_client_add(url, media_type, paused, dir, &config).await?;
+            match (url, id) {
+                (Some(url), None) => {
+                    client::run_client_add(url, media_type, paused, dir, &config).await?;
+                }
+                (None, Some(id)) => {
+                    client::run_client_add_by_id(id, &config).await?;
+                }
+                _ => {
+                    eprintln!("Error: must provide either a URL or --id");
+                    std::process::exit(1);
+                }
+            }
         }
         Some(Command::Daemon { tmux, kill }) => {
             // Handle --kill flag first (before --tmux processing)

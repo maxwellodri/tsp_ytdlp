@@ -84,6 +84,41 @@ pub async fn run_client_add(
     }
 }
 
+pub async fn run_client_add_by_id(id: u64, config: &Config) -> Result<()> {
+    let request = ClientRequest::Status { verbose: false };
+    let response = send_request(request, config).await?;
+
+    match response {
+        ServerResponse::Status { failed_tasks, .. } => {
+            if let Some(task) = failed_tasks.iter().find(|t| t.id == id) {
+                let media_type = match task.task_type.as_str() {
+                    "audio" => MediaType::Audio,
+                    _ => MediaType::Video,
+                };
+                run_client_add(
+                    task.url.clone(),
+                    media_type,
+                    false,
+                    task.download_dir.clone(),
+                    config,
+                )
+                .await
+            } else {
+                println!("Task ID {} not found in failed tasks", id);
+                std::process::exit(1);
+            }
+        }
+        ServerResponse::Error { message } => {
+            eprintln!("Error: {}", message);
+            std::process::exit(1);
+        }
+        _ => {
+            eprintln!("Unexpected response from daemon");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Show status of all tasks
 pub async fn run_client_status(verbose: bool, config: &Config, filter_failed: bool) -> Result<()> {
     let request = ClientRequest::Status { verbose };
@@ -365,7 +400,11 @@ pub async fn run_client_failed(config: &Config) -> Result<()> {
                 println!("{:<6} | URL", "ID");
                 println!("{:-<6}-+-{:-<60}", "", "");
                 for task in &failed_tasks {
-                    println!("{:<6} | {}", task.id, task.url);
+                    if let Some(ref dir) = task.download_dir {
+                        println!("{:<6} | {} (to {})", task.id, task.url, dir);
+                    } else {
+                        println!("{:<6} | {}", task.id, task.url);
+                    }
                     if let Some(ref error) = task.error {
                         println!("{:<6} | Error: {}", "", error);
                     }
